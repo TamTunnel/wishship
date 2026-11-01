@@ -90,7 +90,18 @@ vote → approve → build → verify → review → ship.
   (`const n = arr.push(...)`) applies the push side effect in
   sequential mode, mirroring `.push.apply` — previously only push
   statements were tracked, so an RHS push left the array empty to
-  the scan. A token split across lines
+  the scan. Round 11 closes the last two push positions: pushes
+  into member-expression targets (`holders[0].push(...)`,
+  `o.arr.push(...)`, nested paths — in statement, RHS, and
+  apply/call forms) resolve the target as a binding, writing the
+  fanned-out result back through the key path, so branchy pushes
+  into a member resolve branch-correctly instead of keeping the
+  flat fallback; and helper-body evaluation now inherits the pass
+  mode, so RHS pushes (plain and apply/call) inside helpers are
+  tracked exactly as at top level (the fixpoint pass itself stays
+  assignments-only). Targets with no key path (computed indices,
+  calls in the chain) still keep the in-place flat fallback — the
+  remaining narrow miss. A token split across lines
   or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
   operator is NOT flagged: concatenating neighboring literals fabricated tokens
   that do not exist in the source (it once blocked a JSON env dump, where `"1"`

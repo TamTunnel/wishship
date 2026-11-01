@@ -193,7 +193,8 @@ export function scanSecrets(text: string): string[] {
  *   apply/call form) fans out at the target binding — one array
  *   per branch — instead of pushing the set itself as one item
  *   (which `join` could not distribute through, so the
- *   reconstruction shipped); a non-ident thisArg falls back to
+ *   reconstruction shipped); a thisArg with no member key path
+ *   (computed indices, calls in the chain) falls back to
  *   value-level pushes (position-wise set items when all variants
  *   share a length, flat otherwise — a known narrow miss for
  *   unequal lengths). Method-shorthand object definitions
@@ -209,12 +210,27 @@ export function scanSecrets(text: string): string[] {
  *   hijacked. A push.apply nested inside a larger non-statement
  *   expression (fixpoint/bare passes) is still not
  *   side-effect-tracked by design, except assignment-RHS cases
- *   via the Parser (where the value-level fallback above applies).
+ *   via the Parser (where the key-path write-back above applies;
+ *   the value-level fallback survives only for keyless thisArgs).
  * - plain push in assignment RHS (round 10b): `const n =
  *   arr.push(...)` now applies the push side effect in the Parser
  *   in sequential mode only, mirroring `.push.apply` — previously
  *   only push statements were tracked, so an RHS push left the
  *   array [] to the scan and the joined value shipped.
+ * - member-target pushes and helper-body push mode (round 11):
+ *   push targets are resolved as bindings: a member-expression
+ *   target (`holders[0]`, `o.arr`, nested paths) is parsed into
+ *   a key path (base ident + literal/bound segments, the shapes
+ *   member reads already handle) and the fanned-out result is
+ *   written back through it, in statement, RHS, and apply/call
+ *   positions — previously only bare-ident targets fanned out,
+ *   so member targets kept the flat fallback and shipped.
+ *   Targets with no key path (computed indices, calls in the
+ *   chain) still keep the in-place flat fallback. Helper-body
+ *   evaluation now inherits the pass mode, so RHS pushes (plain
+ *   and apply/call) inside helpers are tracked exactly as at top
+ *   level; the fixpoint pass itself stays assignments-only (its
+ *   mode still gates those branches off).
  *
  * Deliberately NOT modeled (stays unknown, never flagged alone):
  * - recursion, closures over mutated state, classes, `eval`, and
@@ -1233,6 +1249,71 @@ function pushApplyElemVariants(
 }
 
 /**
+ * Array targets for a value-level push (round 11): a bare array
+ * itself, or each array member of a set. Used by member-target
+ * push sites, where there is no binding to rebind — the push
+ * mutates the shared value objects in place, so later member
+ * reads through the binding see it.
+ */
+function targetArraysOf(v: Value): Value[] {
+  const out: Value[] = [];
+  if (v !== null && v.kind === "array") out.push(v);
+  else if (v !== null && v.kind === "set") {
+    for (const m of v.values) if (m !== null && m.kind === "array") out.push(m);
+  }
+  return out;
+}
+
+/**
+ * Apply push element-list variants in place to resolved target
+ * arrays (round 11): one variant pushes its elements; several
+ * equal-length variants push position-wise set items (join
+ * distributes over set items, so branch combinations forming a
+ * secret still flag); unequal-length variants push the flat
+ * fallback list. Mirrors the 10b Parser branch and the
+ * push.apply fallbacks, shared by the member-target push sites
+ * in the statement walk and in helper bodies.
+ */
+function pushVariantsIntoTargets(targets: Value[], variants: Value[][], flat: Value[]): void {
+  if (variants.length === 1) {
+    const els = variants[0] ?? [];
+    for (const t of targets) {
+      if (t !== null && t.kind === "array") t.items.push(...els);
+    }
+  } else if (variants.length > 1) {
+    const len = variants[0]?.length ?? 0;
+    const equal = variants.every((v) => v.length === len);
+    if (equal) {
+      for (const t of targets) {
+        if (t === null || t.kind !== "array") continue;
+        for (let i = 0; i < len; i++) {
+          t.items.push(makeSet(variants.map((v) => v[i] ?? null)));
+        }
+      }
+    } else {
+      for (const t of targets) {
+        if (t !== null && t.kind === "array") t.items.push(...flat);
+      }
+    }
+  }
+}
+
+/**
+ * Flat fallback element list for a plain push's raw args (round
+ * 11): spread arrays inline their items, anything else contributes
+ * itself — the same fallback the 10b Parser branch uses for
+ * unequal-length variants.
+ */
+function flatPlainPushArgs(raw: RawArg[]): Value[] {
+  const flat: Value[] = [];
+  for (const a of raw) {
+    if (a.spread && a.value !== null && a.value.kind === "array") flat.push(...a.value.items);
+    else flat.push(a.value);
+  }
+  return flat;
+}
+
+/**
  * Evaluate String.fromCharCode / fromCodePoint over an already
  * parsed argument list (round 10). The args-based half of
  * Parser.evalFromCodes, reused for set-valued callee members
@@ -1901,9 +1982,33 @@ class Parser {
             this.ctx.mode === "sequential" &&
             v !== null && (v.kind === "array" || v.kind === "set")
           ) {
+            // Round 11: the receiver chain tokens (everything
+            // before the `.` this.pos sits on). When they form a
+            // member key path, resolve the push as a binding:
+            // fan out with applyPushVariants and write back, so
+            // unequal variants resolve branch-correctly. Without
+            // a key path (computed indices, calls in the chain),
+            // keep the in-place behavior below.
+            const receiverToks = this.toks.slice(start, this.pos);
             this.pos += 3;
             const raw = this.parseArgsRaw();
             const variants = expandArgVariants(raw);
+            const keyPath = parseMemberKeys(receiverToks, this.env);
+            if (keyPath !== null) {
+              const next = applyPushVariants(v, variants);
+              if (next === undefined || next === null) return null;
+              writeBackBinding(this.env, keyPath.keys, next);
+              const lens: Value[] = [];
+              if (next.kind === "array") {
+                lens.push({ kind: "number", value: next.items.length });
+              } else if (next.kind === "set") {
+                for (const m of next.values) {
+                  if (m !== null && m.kind === "array") lens.push({ kind: "number", value: m.items.length });
+                }
+              }
+              v = makeSet(lens);
+              continue;
+            }
             const targets: Value[] = [];
             if (v.kind === "array") targets.push(v);
             else {
@@ -2197,16 +2302,38 @@ class Parser {
         if (parsed.length < 1) return null;
         target = parsed[0].value;
       }
-      // Round 10: element-list variants fan out (a spread-of-set
-      // argArray leaves one variant per member array). The Parser
-      // cannot rebind a name, so multi-variant pushes append
-      // position-wise set items when all variants share a length
-      // (join distributes over set items, so branch combinations
-      // forming a secret still flag); unequal-length variants
-      // keep today's flat behavior — a known narrow miss,
-      // documented in the header. Statement-level pushes, which
-      // carry the judge repros, fan out exactly via bindings.
+      // Element-list variants fan out (a spread-of-set
+      // argArray leaves one variant per member array). When
+      // the thisArg has a key path, the fan-out writes back
+      // (round 11, below); otherwise multi-variant pushes
+      // append position-wise set items when all variants share
+      // a length (join distributes over set items, so branch
+      // combinations forming a secret still flag) and keep
+      // today's flat behavior for unequal lengths — a known
+      // narrow miss, documented in the header.
       const elemVariants = pushApplyElemVariants(kind, parsed);
+      // Round 11: when the thisArg forms a member key path,
+      // resolve it as a binding (fan out + write back) instead
+      // of the in-place fallback below, so unequal variants
+      // resolve branch-correctly. The flat fallback survives
+      // only for thisArgs with no key path (computed indices,
+      // calls in the chain) — the documented narrow miss.
+      const thisArgToks = groups.length > 0 ? (groups[0] ?? []) : [];
+      const keyPath = parseMemberKeys(thisArgToks, this.env);
+      if (keyPath !== null) {
+        const next = target === null ? undefined : applyPushVariants(target, elemVariants);
+        if (next === undefined || next === null) return null;
+        writeBackBinding(this.env, keyPath.keys, next);
+        const lens: Value[] = [];
+        if (next.kind === "array") {
+          lens.push({ kind: "number", value: next.items.length });
+        } else if (next.kind === "set") {
+          for (const m of next.values) {
+            if (m !== null && m.kind === "array") lens.push({ kind: "number", value: m.items.length });
+          }
+        }
+        return makeSet(lens);
+      }
       const targets: Value[] = [];
       if (target !== null && target.kind === "array") targets.push(target);
       else if (target !== null && target.kind === "set") {
@@ -2793,6 +2920,16 @@ function evaluateFunction(
     depth: ctx.depth + 1,
     stack: new Set(ctx.stack).add(def),
     steps: ctx.steps,
+    // Round 11: inherit the pass mode, so helper-body evaluation
+    // sees the same sequential/fixpoint mode as top-level
+    // evaluation. Previously the mode was dropped here, so
+    // sequential-only Parser branches (plain push in an assignment
+    // RHS, `.push.apply` / `.push.call`) never fired inside helper
+    // bodies while the identical statement push did — an RHS push
+    // in a helper shipped. Fixpoint stays assignments-only: the
+    // fixpoint walk sets mode "fixpoint", which still gates those
+    // branches off, and ad-hoc parsers have no mode at all.
+    mode: ctx.mode,
   };
   if (!def.isBlock) {
     const p = new Parser(def.bodyToks, env, next);
@@ -3211,6 +3348,111 @@ function execSimple(slice: Tok[], env: Map<string, Value>, ctx: EvalCtx): void {
     }
     return;
   }
+  // Round 11: push statements with a MEMBER-EXPRESSION target
+  // (`holders[0].push(...)`, `o.arr.push(...)`, and the
+  // `.push.apply` / `.push.call` forms), mirroring the statement
+  // walk: the bare-ident branches above only match `name.push(`,
+  // so a member target fell through to the assignment path and
+  // was ignored. Scan for a top-level `.push(` /
+  // `.push.apply(` / `.push.call(`, resolve the target with the
+  // Parser, and apply the push variants in place. For
+  // apply/call the target is the thisArg (a bare-ident thisArg
+  // fans out at its binding, anything else pushes in place).
+  {
+    let depth = 0;
+    let k = j;
+    let match: { dot: number; kind: "push" | "apply" | "call"; argsStart: number } | null = null;
+    while (k < slice.length) {
+      const t = slice[k];
+      if (t?.t === "punct" && (t.v === "(" || t.v === "[" || t.v === "{")) {
+        depth++;
+        k++;
+        continue;
+      }
+      if (t?.t === "punct" && (t.v === ")" || t.v === "]" || t.v === "}")) {
+        if (depth === 0) break;
+        depth--;
+        k++;
+        continue;
+      }
+      const afterDot = slice[k + 1];
+      if (
+        depth === 0 && t?.t === "punct" && t.v === "." &&
+        afterDot?.t === "ident" && afterDot.v === "push"
+      ) {
+        const afterPush = slice[k + 2];
+        if (afterPush?.t === "punct" && afterPush.v === "(") {
+          match = { dot: k, kind: "push", argsStart: k + 3 };
+          break;
+        }
+        const dot2 = slice[k + 2];
+        const applyName = slice[k + 3];
+        const applyOpen = slice[k + 4];
+        if (
+          dot2?.t === "punct" && dot2.v === "." &&
+          applyName?.t === "ident" && (applyName.v === "apply" || applyName.v === "call") &&
+          applyOpen?.t === "punct" && applyOpen.v === "("
+        ) {
+          match = { dot: k, kind: applyName.v as "apply" | "call", argsStart: k + 5 };
+          break;
+        }
+      }
+      k++;
+    }
+    if (match !== null && match.dot > j + 1) {
+      if (match.kind === "push") {
+        const targetToks = slice.slice(j, match.dot);
+        const tp = new Parser(targetToks, env, ctx);
+        const target = tp.parseExpr();
+        if (tp.pos === match.dot - j && target !== null && (target.kind === "array" || target.kind === "set")) {
+          const ap = new Parser(slice, env, ctx);
+          ap.pos = match.argsStart;
+          const raw = ap.parseArgsRaw();
+          const variants = expandArgVariants(raw);
+          const keyPath = parseMemberKeys(targetToks, env);
+          if (keyPath !== null) {
+            const next = applyPushVariants(target, variants);
+            if (next !== undefined) writeBackBinding(env, keyPath.keys, next);
+          } else {
+            pushVariantsIntoTargets(targetArraysOf(target), variants, flatPlainPushArgs(raw));
+          }
+          return;
+        }
+      } else {
+        const close = matchBracket(slice, match.argsStart - 1);
+        const groups = close === -1 ? [] : splitTopLevel(slice.slice(match.argsStart, close));
+        const ap = new Parser(slice, env, ctx);
+        ap.pos = match.argsStart;
+        const raw = ap.parseArgsRaw();
+        const elemVariants = pushApplyElemVariants(match.kind, raw);
+        const keyPath = groups.length > 0 ? parseMemberKeys(groups[0] ?? [], env) : null;
+        if (keyPath !== null) {
+          const cur = raw.length > 0 ? raw[0].value : null;
+          const next = cur === null ? undefined : applyPushVariants(cur, elemVariants);
+          if (next !== undefined) writeBackBinding(env, keyPath.keys, next);
+        } else {
+          const target = raw.length > 0 ? raw[0].value : null;
+          let flat: Value[] = [];
+          if (match.kind === "apply") {
+            if (raw.length >= 2) {
+              const arr = raw[1].value;
+              if (arr !== null && arr.kind === "array") flat = [...arr.items];
+              else if (arr !== null && arr.kind === "set") flat = [arr];
+            }
+          } else {
+            for (const a of raw.slice(1)) {
+              if (a.spread && a.value !== null && a.value.kind === "array") flat.push(...a.value.items);
+              else flat.push(a.value);
+            }
+          }
+          pushVariantsIntoTargets(targetArraysOf(target), elemVariants, flat);
+        }
+        return;
+      }
+      // Not handled (e.g. the target did not parse as a single
+      // expression): fall through to the assignment path below.
+    }
+  }
   const keys: string[] = [nameTok.v];
   let k = j + 1;
   let ok = true;
@@ -3423,6 +3665,70 @@ function rawLiteralConcat(slice: Tok[]): string | null {
  * overwritten (first-write-wins), except that a null placeholder left
  * by an earlier pass may still be filled when its dependencies bind.
  */
+/**
+ * Key path for a member-expression token slice (round 11):
+ * base ident followed by `.key`, `["key"]`, `[0]`, or
+ * `[bound-string-ident]` segments — the shapes the member
+ * read/assignment machinery already handles. Returns the keys,
+ * or null when the slice is not a pure member chain (calls,
+ * computed indices, operators). A single ident yields a
+ * one-element path (a plain binding).
+ */
+function parseMemberKeys(toks: Tok[], env: Map<string, Value>): { keys: string[] } | null {
+  const first = toks[0];
+  if (first?.t !== "ident") return null;
+  const keys: string[] = [first.v];
+  let k = 1;
+  while (k < toks.length) {
+    const sep = toks[k];
+    const keyTok = toks[k + 1];
+    if (sep?.t === "punct" && sep.v === "." && keyTok?.t === "ident") {
+      keys.push(keyTok.v);
+      k += 2;
+      continue;
+    }
+    if (sep?.t === "punct" && sep.v === "[") {
+      const inner = toks[k + 1];
+      const close = toks[k + 2];
+      if (
+        (inner?.t === "string" || inner?.t === "number") &&
+        close?.t === "punct" && close.v === "]"
+      ) {
+        keys.push(inner.v);
+        k += 3;
+        continue;
+      }
+      if (inner?.t === "ident" && close?.t === "punct" && close.v === "]") {
+        const bound = env.get(inner.v);
+        if (bound !== null && bound !== undefined && bound.kind === "string") {
+          keys.push(bound.value);
+          k += 3;
+          continue;
+        }
+      }
+      return null;
+    }
+    return null;
+  }
+  return { keys };
+}
+
+/**
+ * Write a fanned-out push result back to a binding (round 11):
+ * a single key is a plain env assignment; a longer path goes
+ * through applyMemberAssign (sequential mode overwrites the
+ * leaf). Callers only invoke this when the target resolved to
+ * an array or set, so the path exists.
+ */
+function writeBackBinding(env: Map<string, Value>, keys: string[], value: Value): void {
+  if (keys.length === 1) {
+    const name = keys[0];
+    if (name !== undefined) env.set(name, value);
+    return;
+  }
+  applyMemberAssign(env, keys, value, false, "sequential");
+}
+
 function applyMemberAssign(
   env: Map<string, Value>,
   keys: string[],
@@ -3711,6 +4017,147 @@ function walkStatements(
       const semi = toks[p.pos];
       if (semi?.t === "punct" && semi.v === ";") p.pos++;
       continue;
+    }
+    // Round 11: push statements with a MEMBER-EXPRESSION target
+    // (`holders[0].push(...)`, `o.arr.push(...)`,
+    // `o.inner.list.push(...)`, and the `.push.apply` /
+    // `.push.call` forms). The bare-ident branches above only
+    // match `name.push(`; a member target fell through to the
+    // assignment path below and was skipped token by token, so
+    // the push never applied and the joined value shipped — an
+    // ordinary shape (`matrix[i].push(x)`, `obj.list.push(x)`),
+    // not a corner. Scan for a top-level `.push(` /
+    // `.push.apply(` / `.push.call(`, resolve the target
+    // expression with the Parser (member reads already resolve
+    // since round 5, and the value object is shared with the
+    // binding, so in-place pushes propagate), and apply the push
+    // variants in place. For apply/call the target is the
+    // thisArg (exact JS semantics — the receiver is irrelevant):
+    // a bare-ident thisArg fans out at its binding, anything
+    // else pushes in place into the resolved arrays, mirroring
+    // the non-ident thisArg fallback of the branch above.
+    // Sequential mode only, like the other push branches.
+    if (mode === "sequential" && nameTok?.t === "ident") {
+      let depth = 0;
+      let k = j;
+      let match: { dot: number; kind: "push" | "apply" | "call"; argsStart: number } | null = null;
+      while (k < toks.length) {
+        const t = toks[k];
+        if (t?.t === "punct" && (t.v === "(" || t.v === "[" || t.v === "{")) {
+          depth++;
+          k++;
+          continue;
+        }
+        if (t?.t === "punct" && (t.v === ")" || t.v === "]" || t.v === "}")) {
+          if (depth === 0) break;
+          depth--;
+          k++;
+          continue;
+        }
+        if (depth === 0 && t?.t === "punct" && t.v === ";") break;
+        const afterDot = toks[k + 1];
+        if (
+          depth === 0 && t?.t === "punct" && t.v === "." &&
+          afterDot?.t === "ident" && afterDot.v === "push"
+        ) {
+          const afterPush = toks[k + 2];
+          if (afterPush?.t === "punct" && afterPush.v === "(") {
+            match = { dot: k, kind: "push", argsStart: k + 3 };
+            break;
+          }
+          const dot2 = toks[k + 2];
+          const applyName = toks[k + 3];
+          const applyOpen = toks[k + 4];
+          if (
+            dot2?.t === "punct" && dot2.v === "." &&
+            applyName?.t === "ident" && (applyName.v === "apply" || applyName.v === "call") &&
+            applyOpen?.t === "punct" && applyOpen.v === "("
+          ) {
+            match = { dot: k, kind: applyName.v as "apply" | "call", argsStart: k + 5 };
+            break;
+          }
+        }
+        k++;
+      }
+      // A dot past the base ident means a genuine member chain;
+      // a bare-ident target never reaches here (the branches
+      // above already claimed it in sequential mode).
+      if (match !== null && match.dot > j + 1) {
+        let handled = false;
+        if (match.kind === "push") {
+          const targetToks = toks.slice(j, match.dot);
+          const tp = new Parser(targetToks, env, ctx);
+          const target = tp.parseExpr();
+          if (tp.pos === match.dot - j && target !== null && (target.kind === "array" || target.kind === "set")) {
+            p.pos = match.argsStart;
+            const raw = p.parseArgsRaw();
+            const variants = expandArgVariants(raw);
+            const keyPath = parseMemberKeys(targetToks, env);
+            if (keyPath !== null) {
+              // Resolve as a binding: fan branchy pushes out
+              // into one array per branch and write back, so
+              // unequal variants resolve branch-correctly
+              // instead of pushing a set item that `join`
+              // cannot distribute through.
+              const next = applyPushVariants(target, variants);
+              if (next !== undefined) writeBackBinding(env, keyPath.keys, next);
+            } else {
+              pushVariantsIntoTargets(targetArraysOf(target), variants, flatPlainPushArgs(raw));
+            }
+            handled = true;
+          }
+        } else {
+          p.pos = match.argsStart;
+          const raw = p.parseArgsRaw();
+          const elemVariants = pushApplyElemVariants(match.kind, raw);
+          let d2 = 0;
+          let e = match.argsStart;
+          while (e < toks.length) {
+            const t = toks[e];
+            if (t?.t === "punct" && (t.v === "(" || t.v === "[" || t.v === "{")) d2++;
+            else if (t?.t === "punct" && (t.v === ")" || t.v === "]" || t.v === "}")) {
+              if (d2 === 0) break;
+              d2--;
+            } else if (d2 === 0 && t?.t === "punct" && t.v === ",") break;
+            e++;
+          }
+          const thisArgToks = toks.slice(match.argsStart, e);
+          const keyPath = parseMemberKeys(thisArgToks, env);
+          if (keyPath !== null) {
+            // Resolve the thisArg as a binding (a bare ident is
+            // the one-element path): fan out and write back, so
+            // unequal variants resolve branch-correctly.
+            const cur = raw.length > 0 ? raw[0].value : null;
+            const next = cur === null ? undefined : applyPushVariants(cur, elemVariants);
+            if (next !== undefined) writeBackBinding(env, keyPath.keys, next);
+          } else {
+            const target = raw.length > 0 ? raw[0].value : null;
+            let flat: Value[] = [];
+            if (match.kind === "apply") {
+              if (raw.length >= 2) {
+                const arr = raw[1].value;
+                if (arr !== null && arr.kind === "array") flat = [...arr.items];
+                else if (arr !== null && arr.kind === "set") flat = [arr];
+              }
+            } else {
+              for (const a of raw.slice(1)) {
+                if (a.spread && a.value !== null && a.value.kind === "array") flat.push(...a.value.items);
+                else flat.push(a.value);
+              }
+            }
+            pushVariantsIntoTargets(targetArraysOf(target), elemVariants, flat);
+          }
+          handled = true;
+        }
+        if (handled) {
+          const semi = toks[p.pos];
+          if (semi?.t === "punct" && semi.v === ";") p.pos++;
+          continue;
+        }
+        // Not handled (e.g. the target did not parse as a single
+        // expression — an assignment whose RHS contains a push):
+        // fall through to the assignment path below.
+      }
     }
     // Member assignment path: base (.key | ["key"] | [0] | [bound])* =
     // rhs (or +=). Binds into the object/array value so later member
