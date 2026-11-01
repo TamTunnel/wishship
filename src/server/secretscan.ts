@@ -105,17 +105,30 @@ export function scanSecrets(text: string): string[] {
  * - `.join(sep)` where sep is a literal OR a resolved variable
  *   (default ","), over literal, identifier, spread, and push-built
  *   arrays (`.push()` appends applied in diff order)
- * - `String.fromCharCode(...)` with numeric-literal arguments
+ * - `String.fromCharCode(...)` and `String.fromCodePoint(...)` with
+ *   numeric-literal arguments; `String(x)` coercion; `atob(x)` and
+ *   `Buffer.from(x, "base64"|"base64url"|"hex")` decoding (the decoded
+ *   value is scanned, not just the encoded text)
+ * - object member bindings: `{}` literals plus key assignments in
+ *   diff order (`o.a`, `o["a"]`, nested paths, array indices), so
+ *   member reads resolve through the same environments
+ * - string methods on resolved receivers with literal-or-resolved
+ *   arguments, computed with the real JS method: slice, substring,
+ *   substr, replace, replaceAll, trim, trimStart, trimEnd,
+ *   toUpperCase, toLowerCase, split (→ resolved array, so
+ *   split→join chains resolve), charAt, at, padStart, padEnd,
+ *   toString; array at()/toString()
  * - reassignment, last-write-wins in the sequential pass
  * - two-step propagation (key = a + b; full = key + c)
  *
  * Deliberately NOT modeled (stays unknown, never flagged alone):
- * - function calls other than concat/join/fromCharCode, member
- *   expressions, ternary/conditional right-hand sides as assignments
- *   (their branch expressions ARE still scanned by the bare pass),
- * - slice/substring/replace/atob/Buffer decodes and other string
- *   transforms, regex literals, and values that come from outside the
- *   diff (base code, imports, parameters, runtime input).
+ * - function calls other than the ones above, and values that come
+ *   from outside the diff (base code, imports, parameters, runtime
+ *   input) — including the half-in-base case: a diff that adds only
+ *   the second half of a secret whose first half is already committed
+ *   cannot be resolved by diff-only scanning (see README scope note).
+ *   Ternary/conditional right-hand sides as assignments stay unknown
+ *   (their branch expressions ARE still scanned by the bare pass).
  * - adjacent quoted literals with no join operator between them:
  *   concatenating mere neighbors fabricates tokens that do not exist
  *   in the source — it false-positived on a JSON env dump, where "1"
@@ -139,15 +152,20 @@ export function scanSecrets(text: string): string[] {
  */
 
 // ---- value model: a resolved string, a resolved array (elements may
-// themselves be unknown), or null for "not resolvable". ----
+// themselves be unknown), a resolved object (property values may
+// themselves be unknown), a regex literal, or null for "not
+// resolvable". ----
 
 type StrVal = { kind: "string"; value: string };
 type ArrVal = { kind: "array"; items: Value[] };
-type Value = StrVal | ArrVal | null;
+type ObjVal = { kind: "object"; props: Map<string, Value> };
+type RegexVal = { kind: "regex"; pattern: string; flags: string };
+type Value = StrVal | ArrVal | ObjVal | RegexVal | null;
 
 function coerceToString(v: Value): string | null {
   if (v === null) return null;
   if (v.kind === "string") return v.value;
+  if (v.kind !== "array") return null;
   const parts: string[] = [];
   for (const it of v.items) {
     const s = coerceToString(it);
@@ -162,6 +180,157 @@ function addValues(a: Value, b: Value): Value {
   const sb = coerceToString(b);
   if (sa === null || sb === null) return null;
   return { kind: "string", value: sa + sb };
+}
+
+// Numeric argument for a string method: undefined = argument absent,
+// null = unresolvable (unknown value, non-string, or non-array).
+// A present numeric string is converted with Number(), matching JS
+// coercion (NaN then behaves per the real method, since we call it).
+function numArg(a: Value | undefined): number | undefined | null {
+  if (a === undefined) return undefined;
+  if (a === null || a.kind !== "string") return null;
+  return Number(a.value);
+}
+
+/**
+ * Evaluate a string method on a resolved receiver with fully resolved
+ * arguments, using the REAL JS method — so slice/substring arg
+ * swapping and clamping, replace-all semantics, and split limits are
+ * exact, not approximated. Returns null when any argument is
+ * unresolvable (unknown stays unknown, never flagged alone).
+ */
+function evalStringMethod(
+  recv: string,
+  name: string,
+  args: Value[],
+): Value {
+  const bad = (): null => null;
+  switch (name) {
+    case "slice": {
+      const start = numArg(args[0]);
+      const end = numArg(args[1]);
+      if (start === null || end === null) return bad();
+      return { kind: "string", value: recv.slice(start, end) };
+    }
+    case "substring": {
+      const start = numArg(args[0]);
+      const end = numArg(args[1]);
+      if (start === null || end === null) return bad();
+      return { kind: "string", value: recv.substring(start ?? 0, end) };
+    }
+    case "substr": {
+      const start = numArg(args[0]);
+      const len = numArg(args[1]);
+      if (start === null || len === null) return bad();
+      return { kind: "string", value: recv.substr(start ?? 0, len) };
+    }
+    case "replace":
+    case "replaceAll": {
+      const search = args[0];
+      const replacement = args[1];
+      if (search === undefined || replacement === undefined) return bad();
+      const rep = coerceToString(replacement);
+      if (rep === null) return bad();
+      if (search === null) return bad();
+      if (search.kind === "string") {
+        return {
+          kind: "string",
+          value: name === "replace"
+            ? recv.replace(search.value, rep)
+            : recv.replaceAll(search.value, rep),
+        };
+      }
+      if (search.kind === "regex") {
+        let re: RegExp;
+        try {
+          re = new RegExp(search.pattern, search.flags);
+        } catch {
+          return bad();
+        }
+        if (name === "replaceAll" && !re.flags.includes("g")) return bad();
+        return {
+          kind: "string",
+          value: name === "replace"
+            ? recv.replace(re, rep)
+            : recv.replaceAll(re, rep),
+        };
+      }
+      return bad();
+    }
+    case "trim":
+      return { kind: "string", value: recv.trim() };
+    case "trimStart":
+      return { kind: "string", value: recv.trimStart() };
+    case "trimEnd":
+      return { kind: "string", value: recv.trimEnd() };
+    case "toUpperCase":
+      return { kind: "string", value: recv.toUpperCase() };
+    case "toLowerCase":
+      return { kind: "string", value: recv.toLowerCase() };
+    case "split": {
+      const sep = args[0];
+      const limit = numArg(args[1]);
+      if (sep === null || limit === null) return bad();
+      let parts: string[];
+      if (sep === undefined) {
+        parts = [recv];
+      } else if (sep.kind === "string") {
+        parts = recv.split(sep.value);
+      } else if (sep.kind === "regex") {
+        try {
+          parts = recv.split(new RegExp(sep.pattern, sep.flags));
+        } catch {
+          return bad();
+        }
+      } else {
+        return bad();
+      }
+      if (limit !== undefined) parts = parts.slice(0, limit);
+      return {
+        kind: "array",
+        items: parts.map((p) => ({ kind: "string" as const, value: p })),
+      };
+    }
+    case "charAt": {
+      const idx = numArg(args[0]);
+      if (idx === null) return bad();
+      return { kind: "string", value: recv.charAt(idx ?? 0) };
+    }
+    case "at": {
+      const idx = numArg(args[0]);
+      if (idx === null) return bad();
+      const out = recv.at(idx ?? 0);
+      return out === undefined ? null : { kind: "string", value: out };
+    }
+    case "padStart": {
+      const len = numArg(args[0]);
+      const pad = args[1] === undefined ? " " : coerceToString(args[1]);
+      if (len === null || pad === null) return bad();
+      return { kind: "string", value: recv.padStart(len ?? 0, pad) };
+    }
+    case "padEnd": {
+      const len = numArg(args[0]);
+      const pad = args[1] === undefined ? " " : coerceToString(args[1]);
+      if (len === null || pad === null) return bad();
+      return { kind: "string", value: recv.padEnd(len ?? 0, pad) };
+    }
+    case "toString":
+      return { kind: "string", value: recv };
+    default:
+      return bad();
+  }
+}
+
+/** Decode a base64 (or base64url) string to bytes-as-latin1, or null. */
+function decodeBase64(s: string, urlSafe: boolean): string | null {
+  try {
+    const buf = urlSafe
+      ? Buffer.from(s, "base64url")
+      : Buffer.from(s, "base64");
+    return buf.toString("latin1");
+  } catch {
+    return null;
+  }
 }
 
 // ---- tokenizer ----
@@ -423,75 +592,184 @@ class Parser {
   private parsePostfix(): Value {
     const start = this.pos;
     let v = this.parsePrimary();
-    while (this.peekPunct(".")) {
-      const member = this.peek(1);
-      const open = this.peek(2);
-      if (member?.t !== "ident") break;
-      if (open?.t === "punct" && open.v === "(") {
-        // Method call.
-        if (
-          this.pos - start === 1 &&
-          this.toks[start]?.t === "ident" &&
-          this.toks[start].v === "String" &&
-          member.v === "fromCharCode"
-        ) {
-          this.pos += 3;
-          const args = this.parseArgs();
-          const codes: number[] = [];
-          for (const a of args) {
-            if (a !== null && a.kind === "string" && /^-?\d+$/.test(a.value.trim())) {
-              codes.push(parseInt(a.value.trim(), 10));
+    for (;;) {
+      if (this.peekPunct(".")) {
+        const member = this.peek(1);
+        const open = this.peek(2);
+        if (member?.t !== "ident") break;
+        if (open?.t === "punct" && open.v === "(") {
+          // Method call.
+          const recvTok = this.toks[start];
+          if (
+            this.pos - start === 1 &&
+            recvTok?.t === "ident" &&
+            recvTok.v === "String" &&
+            (member.v === "fromCharCode" || member.v === "fromCodePoint")
+          ) {
+            this.pos += 3;
+            const args = this.parseArgs();
+            const codes: number[] = [];
+            for (const a of args) {
+              if (a !== null && a.kind === "string" && /^-?\d+$/.test(a.value.trim())) {
+                codes.push(parseInt(a.value.trim(), 10));
+              } else {
+                return null;
+              }
+            }
+            try {
+              v = {
+                kind: "string",
+                value: member.v === "fromCharCode"
+                  ? String.fromCharCode(...codes)
+                  : String.fromCodePoint(...codes),
+              };
+            } catch {
+              return null;
+            }
+            continue;
+          }
+          if (
+            this.pos - start === 1 &&
+            recvTok?.t === "ident" &&
+            recvTok.v === "Buffer" &&
+            member.v === "from"
+          ) {
+            this.pos += 3;
+            const args = this.parseArgs();
+            const data = args[0];
+            if (data === undefined || data === null || data.kind !== "string") return null;
+            const enc = args[1] === undefined ? "utf8" : coerceToString(args[1]);
+            if (enc === null) return null;
+            if (enc === "base64" || enc === "base64url") {
+              const decoded = decodeBase64(data.value, enc === "base64url");
+              if (decoded === null) return null;
+              v = { kind: "string", value: decoded };
+            } else if (
+              enc === "utf8" || enc === "utf-8" || enc === "ascii" ||
+              enc === "latin1" || enc === "binary"
+            ) {
+              v = { kind: "string", value: data.value };
+            } else if (enc === "hex") {
+              try {
+                v = { kind: "string", value: Buffer.from(data.value, "hex").toString("latin1") };
+              } catch {
+                return null;
+              }
             } else {
               return null;
             }
+            continue;
           }
-          v = { kind: "string", value: String.fromCharCode(...codes) };
-          continue;
-        }
-        if (member.v === "concat" || member.v === "join") {
-          this.pos += 3;
-          const args = this.parseArgs();
-          if (member.v === "concat") {
-            if (v === null) return null;
-            if (v.kind === "string") {
-              let out = v.value;
-              for (const a of args) {
-                const s = coerceToString(a);
-                if (s === null) return null;
-                out += s;
+          if (member.v === "concat" || member.v === "join") {
+            this.pos += 3;
+            const args = this.parseArgs();
+            if (member.v === "concat") {
+              if (v === null) return null;
+              if (v.kind === "string") {
+                let out = v.value;
+                for (const a of args) {
+                  const s = coerceToString(a);
+                  if (s === null) return null;
+                  out += s;
+                }
+                v = { kind: "string", value: out };
+              } else if (v.kind === "array") {
+                const items = [...v.items];
+                for (const a of args) {
+                  if (a === null) items.push(null);
+                  else if (a.kind === "array") items.push(...a.items);
+                  else items.push(a);
+                }
+                v = { kind: "array", items };
+              } else {
+                return null;
               }
-              v = { kind: "string", value: out };
             } else {
-              const items = [...v.items];
-              for (const a of args) {
-                if (a === null) items.push(null);
-                else if (a.kind === "array") items.push(...a.items);
-                else items.push(a);
+              if (v === null || v.kind !== "array") return null;
+              const sep = args.length === 0 ? "," : coerceToString(args[0]);
+              if (sep === null) return null;
+              const parts: string[] = [];
+              for (const it of v.items) {
+                const s = coerceToString(it);
+                if (s === null) return null;
+                parts.push(s);
               }
-              v = { kind: "array", items };
+              v = { kind: "string", value: parts.join(sep) };
             }
-          } else {
-            if (v === null || v.kind !== "array") return null;
-            const sep = args.length === 0 ? "," : coerceToString(args[0]);
-            if (sep === null) return null;
-            const parts: string[] = [];
-            for (const it of v.items) {
-              const s = coerceToString(it);
-              if (s === null) return null;
-              parts.push(s);
-            }
-            v = { kind: "string", value: parts.join(sep) };
+            continue;
           }
-          continue;
+          // String methods on a resolved string receiver, computed for
+          // real (slice/substring/replace/split/trim/case/...).
+          if (v !== null && v.kind === "string") {
+            this.pos += 3;
+            const args = this.parseArgs();
+            const out = evalStringMethod(v.value, member.v, args);
+            if (out === null) return null;
+            v = out;
+            continue;
+          }
+          // Array methods: at(i) reads an element, toString() joins.
+          if (v !== null && v.kind === "array") {
+            if (member.v === "at") {
+              this.pos += 3;
+              const args = this.parseArgs();
+              const idx = numArg(args[0]);
+              if (idx === null || idx === undefined) return null;
+              const item = v.items[idx];
+              if (item === undefined) return null;
+              v = item;
+              continue;
+            }
+            if (member.v === "toString") {
+              this.pos += 3;
+              this.parseArgs();
+              const s = coerceToString(v);
+              if (s === null) return null;
+              v = { kind: "string", value: s };
+              continue;
+            }
+          }
+          // Any other method call: unknown result; consume args and stop.
+          this.pos += 3;
+          this.parseArgs();
+          return null;
         }
-        // Any other method call: unknown result; consume args and stop.
-        this.pos += 3;
-        this.parseArgs();
-        return null;
+        // Property access (not a call): on an object receiver this
+        // resolves the member (round 5); on any other receiver the
+        // value is unchanged (e.g. `(a + b).length` still computes a+b).
+        if (v !== null && v.kind === "object") {
+          v = v.props.get(member.v) ?? null;
+        }
+        this.pos += 2;
+        continue;
       }
-      // Property access (not a call): the receiver value is unchanged
-      // for scanning purposes (e.g. `(a + b).length` still computes a+b).
-      this.pos += 2;
+      if (this.peekPunct("[")) {
+        // Index access: arr[i], obj["key"], str[i]. A string index
+        // yields a single character (so char-by-char reconstruction
+        // still resolves through `+` chains); out of range is unknown.
+        this.pos++;
+        const idx = this.parseExpr();
+        if (!this.peekPunct("]")) return null;
+        this.pos++;
+        if (v !== null && v.kind === "array") {
+          const n = numArg(idx);
+          if (n === null || n === undefined) return null;
+          const item = v.items[n];
+          v = item === undefined ? null : item;
+        } else if (v !== null && v.kind === "object") {
+          const k = coerceToString(idx);
+          v = k === null ? null : (v.props.get(k) ?? null);
+        } else if (v !== null && v.kind === "string") {
+          const n = numArg(idx);
+          if (n === null || n === undefined) return null;
+          const ch = v.value[n];
+          v = ch === undefined ? null : { kind: "string", value: ch };
+        } else {
+          v = null;
+        }
+        continue;
+      }
+      break;
     }
     return v;
   }
@@ -542,7 +820,37 @@ class Parser {
       if (tok.v === "false") return { kind: "string", value: "false" };
       if (tok.v === "null") return { kind: "string", value: "null" };
       if (tok.v === "undefined") return { kind: "string", value: "undefined" };
+      // Bare calls with known semantics: String(x) coerces, atob(x)
+      // base64-decodes. Other bare calls are not consumed here (the
+      // callee binding evaluates to unknown, as before).
+      if ((tok.v === "String" || tok.v === "atob") && this.peekPunct("(")) {
+        this.pos++;
+        const args = this.parseArgs();
+        if (tok.v === "String") {
+          const s = args.length === 0 ? "" : coerceToString(args[0]);
+          return s === null ? null : { kind: "string", value: s };
+        }
+        const data = args[0];
+        if (data === undefined || data === null || data.kind !== "string") return null;
+        const decoded = decodeBase64(data.value, false);
+        return decoded === null ? null : { kind: "string", value: decoded };
+      }
       return this.env.get(tok.v) ?? null;
+    }
+    if (tok.t === "regex") {
+      this.pos++;
+      const text = tok.v;
+      const lastSlash = text.lastIndexOf("/");
+      if (lastSlash <= 0) return null;
+      const pattern = text.slice(1, lastSlash);
+      const flags = text.slice(lastSlash + 1);
+      if (!/^[dgimsuvy]*$/.test(flags)) return null;
+      try {
+        new RegExp(pattern, flags);
+      } catch {
+        return null;
+      }
+      return { kind: "regex", pattern, flags };
     }
     if (tok.t === "punct" && tok.v === "(") {
       this.pos++;
@@ -583,19 +891,81 @@ class Parser {
       return { kind: "array", items };
     }
     if (tok.t === "punct" && tok.v === "{") {
-      // Object literal: skip balanced braces, unknown value.
-      this.pos++;
-      let depth = 1;
-      while (!this.atEnd() && depth > 0) {
-        const t = this.toks[this.pos++];
-        if (t.t === "punct" && t.v === "{") depth++;
-        if (t.t === "punct" && t.v === "}") depth--;
-      }
-      return null;
+      return this.parseObjectLiteral();
     }
     // Anything else: consume one token, unknown.
     this.pos++;
     return null;
+  }
+
+  /**
+   * Parse an object literal into an object value (round 5). Entries
+   * are parsed leniently: an unparseable entry (method, computed key
+   * over an unknown expression) is skipped, but entries that do parse
+   * still bind — a member read of a known key resolves. Shorthand
+   * `{name}` binds the environment value of `name`.
+   */
+  private parseObjectLiteral(): Value {
+    // pos is at `{`.
+    this.pos++;
+    const props = new Map<string, Value>();
+    const skipToEntryEnd = (): void => {
+      let depth = 0;
+      while (!this.atEnd()) {
+        const t = this.toks[this.pos];
+        if (t.t === "punct" && (t.v === "{" || t.v === "[" || t.v === "(")) depth++;
+        else if (t.t === "punct" && (t.v === "}" || t.v === "]" || t.v === ")")) {
+          if (depth === 0) return;
+          depth--;
+        } else if (depth === 0 && t.t === "punct" && t.v === ",") return;
+        this.pos++;
+      }
+    };
+    for (;;) {
+      if (this.peekPunct("}")) {
+        this.pos++;
+        break;
+      }
+      if (this.peekPunct(",")) {
+        this.pos++;
+        continue;
+      }
+      if (this.atEnd()) break;
+      if (this.peekPunct("...")) {
+        this.pos++;
+        const v = this.parseExpr();
+        if (v !== null && v.kind === "object") {
+          for (const [k, val] of v.props) props.set(k, val);
+        }
+        continue;
+      }
+      const keyTok = this.peek();
+      let key: string | null = null;
+      if (keyTok?.t === "ident") key = keyTok.v;
+      else if (keyTok?.t === "string") key = keyTok.v;
+      else if (keyTok?.t === "number") key = keyTok.v;
+      if (key === null) {
+        this.pos++;
+        skipToEntryEnd();
+        continue;
+      }
+      const afterKey = this.peek(1);
+      if (afterKey?.t === "punct" && afterKey.v === ":") {
+        this.pos += 2;
+        props.set(key, this.parseExpr());
+        continue;
+      }
+      const next = this.peek(1);
+      if (next?.t === "punct" && (next.v === "," || next.v === "}")) {
+        this.pos++;
+        props.set(key, this.env.get(key) ?? null);
+        continue;
+      }
+      // Method shorthand or computed key: skip to the next entry.
+      this.pos++;
+      skipToEntryEnd();
+    }
+    return { kind: "object", props };
   }
 
   /** Index of the `}` closing the substitution opened at `start - 2`, or -1. */
@@ -662,6 +1032,75 @@ class Parser {
 // ---- statement walk: assignments and .push() ----
 
 /**
+ * Apply `base.key... = rhs` (or `+=`) to the environment (round 5).
+ * Missing containers are created on demand — the member value is
+ * diff-derived either way, so creating the container is fail-closed.
+ * A non-container in the path is a runtime no-op/throw, so it is left
+ * alone. In fixpoint mode an already-bound non-null key is never
+ * overwritten (first-write-wins), except that a null placeholder left
+ * by an earlier pass may still be filled when its dependencies bind.
+ */
+function applyMemberAssign(
+  env: Map<string, Value>,
+  keys: string[],
+  rhs: Value,
+  isPlusEq: boolean,
+  mode: "sequential" | "fixpoint",
+): void {
+  const base = keys[0];
+  let cur = env.get(base);
+  if (cur === undefined) {
+    cur = { kind: "object", props: new Map() };
+    env.set(base, cur);
+  }
+  if (cur === null || (cur.kind !== "object" && cur.kind !== "array")) return;
+  let holder: ObjVal | ArrVal = cur;
+  for (let i = 1; i < keys.length - 1; i++) {
+    const k = keys[i];
+    let next: Value;
+    if (holder.kind === "object") {
+      next = holder.props.get(k) ?? null;
+    } else {
+      const n = Number(k);
+      next = Number.isInteger(n) ? (holder.items[n] ?? null) : null;
+    }
+    if (next === null || (next.kind !== "object" && next.kind !== "array")) {
+      if (next !== null) return; // non-container in the path: no-op
+      next = { kind: "object", props: new Map() };
+      if (holder.kind === "object") holder.props.set(k, next);
+      else {
+        const n = Number(k);
+        if (!Number.isInteger(n)) return;
+        holder.items[n] = next;
+      }
+    }
+    holder = next;
+  }
+  const last = keys[keys.length - 1];
+  if (holder.kind === "object") {
+    const existing = holder.props.get(last);
+    if (mode === "fixpoint" && existing !== undefined && existing !== null) return;
+    if (isPlusEq) {
+      const combined = existing !== undefined ? addValues(existing, rhs) : rhs;
+      holder.props.set(last, combined);
+    } else {
+      holder.props.set(last, rhs);
+    }
+  } else {
+    const n = Number(last);
+    if (!Number.isInteger(n)) return;
+    const existing = holder.items[n];
+    if (mode === "fixpoint" && existing !== undefined && existing !== null) return;
+    if (isPlusEq) {
+      const combined = existing !== undefined ? addValues(existing, rhs) : rhs;
+      holder.items[n] = combined;
+    } else {
+      holder.items[n] = rhs;
+    }
+  }
+}
+
+/**
  * Walks the token stream once, applying assignments (and, in
  * sequential mode, `.push()` appends) to `env`. Returns true if any
  * new binding was added (fixpoint mode only; sequential always
@@ -670,7 +1109,9 @@ class Parser {
  * `}`, `,`, `)` or `]`, or an identifier/string/number/template/
  * regex token (ASI: a new statement may follow an expression end) —
  * so `obj.key = ...` never binds a variable named `key` (previous
- * token `.`) and `x[0] = ...` never binds `x`.
+ * token `.`); instead it binds the member on the object value via
+ * applyMemberAssign (round 5), and `x[0] = ...` binds an array
+ * element, never `x` itself.
  */
 function walkStatements(
   toks: Tok[],
@@ -749,6 +1190,58 @@ function walkStatements(
       const semi = toks[p.pos];
       if (semi?.t === "punct" && semi.v === ";") p.pos++;
       continue;
+    }
+    // Member assignment path: base (.key | ["key"] | [0] | [bound])* =
+    // rhs (or +=). Binds into the object/array value so later member
+    // reads resolve (round 5: `o = {}; o.a = ...; o.a + o.b`).
+    if (nameTok?.t === "ident") {
+      const keys: string[] = [nameTok.v];
+      let k = j + 1;
+      let ok = true;
+      while (true) {
+        const sep = toks[k];
+        const keyTok = toks[k + 1];
+        if (sep?.t === "punct" && sep.v === "." && keyTok?.t === "ident") {
+          keys.push(keyTok.v);
+          k += 2;
+          continue;
+        }
+        if (sep?.t === "punct" && sep.v === "[") {
+          const inner = toks[k + 1];
+          const close = toks[k + 2];
+          if (
+            (inner?.t === "string" || inner?.t === "number") &&
+            close?.t === "punct" && close.v === "]"
+          ) {
+            keys.push(inner.v);
+            k += 3;
+            continue;
+          }
+          if (inner?.t === "ident" && close?.t === "punct" && close.v === "]") {
+            const bound = env.get(inner.v);
+            if (bound !== null && bound !== undefined && bound.kind === "string") {
+              keys.push(bound.value);
+              k += 3;
+              continue;
+            }
+          }
+          ok = false;
+          break;
+        }
+        break;
+      }
+      const eqTok = toks[k];
+      if (
+        ok && keys.length > 1 &&
+        eqTok?.t === "punct" && (eqTok.v === "=" || eqTok.v === "+=")
+      ) {
+        p.pos = k + 1;
+        const rhs = p.parseExpr();
+        applyMemberAssign(env, keys, rhs, eqTok.v === "+=", mode);
+        const semi = toks[p.pos];
+        if (semi?.t === "punct" && semi.v === ";") p.pos++;
+        continue;
+      }
     }
     p.pos++;
   }

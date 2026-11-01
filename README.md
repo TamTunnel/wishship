@@ -279,6 +279,12 @@ so an in-flight run cannot open a PR after the operator pauses.
   in-memory FakeGitHub client, never against a real repo. Verify both on a
   machine with Docker and a real GitHub App installation before trusting a
   production deployment.
+- **Secret-scan scope (diff-only, stated not hidden):** the secret scanner
+  resolves values from added lines only. It cannot resolve bindings from base
+  code, so a PR that adds only the second half of a secret whose first half
+  is already committed is out of scope for this scanner — that case relies on
+  the maintainer reviewing the PR, and on never committing secrets to base
+  in the first place. This is a design limit, not a resolver bug.
 - **Secrets:** installation tokens are short-lived and never stored. The service clone's
   token-bearing remote is stripped immediately after cloning, and token URLs are scrubbed
   from git error output. Stored operator secrets are encrypted at rest (AES-256-GCM, key
