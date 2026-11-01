@@ -74,7 +74,18 @@ vote → approve → build → verify → review → ship.
   `Reflect.apply(fn, thisArg, argArray)` → `fn(...argArray)`), so a
   variadic builtin, modeled builtin, or diff-defined function evaluates
   identically in apply/call form; `.push.apply()` / `.push.call()` append
-  into the thisArg array, as JS specifies. A token split across lines
+  into the thisArg array, as JS specifies. Round 10 completes three
+  more callee/push positions: a spread of a branchy array into
+  `.push()` (plain or apply/call form) fans out at the target
+  binding — one array per branch — instead of pushing the set
+  itself as one item; method-shorthand object definitions
+  (`{ cat(a, b) { ... } }`) bind exactly like property-function
+  forms; and sets distribute through the callee position, so a
+  branchy callee (`pickFn(flag)(...)`, including `.apply`/`.call`
+  forms and object properties holding a set of functions)
+  evaluates per callee member — with `String.fromCharCode` /
+  `String.fromCodePoint` referenced as values resolving to
+  builtin values instead of collapsing to null. A token split across lines
   or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
   operator is NOT flagged: concatenating neighboring literals fabricated tokens
   that do not exist in the source (it once blocked a JSON env dump, where `"1"`
