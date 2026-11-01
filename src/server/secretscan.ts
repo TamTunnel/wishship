@@ -82,3 +82,79 @@ export function scanSecrets(text: string): string[] {
   }
   return hits;
 }
+
+const OPERAND =
+  /([A-Za-z_$][\w$]*|"[^"\n]*"|'[^'\n]*')\s*\+\s*([A-Za-z_$][\w$]*|"[^"\n]*"|'[^'\n]*')/g;
+
+function resolveOperand(
+  tok: string,
+  assigned: Map<string, string>,
+): string | null {
+  const lit = tok.match(/^["']([^"']*)["']$/);
+  if (lit) return lit[1];
+  return assigned.get(tok) ?? null;
+}
+
+/**
+ * Scan added lines for secret-shaped material, including SPLIT tokens.
+ * Per-line scanning alone misses `const a = "sk_live_abcd";` on one
+ * line and `const b = "efghijklmnop1234";` on the next, joined by
+ * `a + b` — neither half matches any pattern, but the reconstruction
+ * is trivial. So, in addition to per-line scanning, this scans:
+ * - the lines joined with newlines and with nothing (a token wrapped
+ *   across a line break),
+ * - `x + y` expressions with operands resolved through same-diff
+ *   `const/let/var name = "literal"` assignments (and through quoted
+ *   literals directly), and
+ * - template literals whose ${...} parts all resolve through those
+ *   assignments.
+ * Deliberately NOT scanned: adjacent quoted literals with no join
+ * operator between them. Concatenating mere neighbors fabricates
+ * tokens that do not exist in the source — it false-positived on a
+ * JSON env dump, where "1" (WISHSHIP_AGENT) + "PATH" + the PATH value
+ * formed an exactly-40-char slash-containing run that tripped
+ * aws-secret-bare. Only an actual join operation is evidence of
+ * reconstruction.
+ * Shape-based detection stays heuristic: an arbitrary high-entropy
+ * blob with no known shape still passes, and that limit is documented
+ * in the README, not hidden.
+ */
+export function scanAddedLines(lines: string[]): string[] {
+  const hits = new Set<string>();
+  const add = (text: string): void => {
+    for (const h of scanSecrets(text)) hits.add(h);
+  };
+  for (const line of lines) add(line);
+  add(lines.join("\n"));
+  add(lines.join(""));
+  const assigned = new Map<string, string>();
+  for (const line of lines) {
+    for (const m of line.matchAll(
+      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["']([^"']*)["']/g,
+    )) {
+      assigned.set(m[1], m[2]);
+    }
+  }
+  for (const line of lines) {
+    for (const m of line.matchAll(OPERAND)) {
+      const left = resolveOperand(m[1], assigned);
+      const right = resolveOperand(m[2], assigned);
+      if (left !== null && right !== null) add(left + right);
+    }
+    for (const tm of line.matchAll(/`([^`]*)`/g)) {
+      const body = tm[1];
+      let resolved = body;
+      let ok = true;
+      for (const ref of body.matchAll(/\$\{([A-Za-z_$][\w$]*)\}/g)) {
+        const v = assigned.get(ref[1]);
+        if (v === undefined) {
+          ok = false;
+          break;
+        }
+        resolved = resolved.replace(ref[0], v);
+      }
+      if (ok && resolved !== body) add(resolved);
+    }
+  }
+  return [...hits];
+}

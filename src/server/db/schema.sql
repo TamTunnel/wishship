@@ -93,12 +93,18 @@ CREATE TABLE IF NOT EXISTS runs (
   duration_ms INT,
   cost_usd NUMERIC(12,4),
   allow_dependencies BOOLEAN NOT NULL DEFAULT false,
+  allow_churn BOOLEAN NOT NULL DEFAULT false,
   failure_reason TEXT,
   retry_of UUID REFERENCES runs(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   finished_at TIMESTAMPTZ
 );
+
+-- Churn override, added after the runs table shipped: IF NOT EXISTS
+-- keeps this a no-op on fresh databases (which get the column inline
+-- above) and backfills databases created before the column existed.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS allow_churn BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS verification_reports (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

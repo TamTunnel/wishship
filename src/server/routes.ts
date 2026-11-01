@@ -547,6 +547,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return reply.code(400).send({ error: "script backend is not configured on this instance" });
     }
     const allowDependencies = bodyOf(req).allowDependencies === true;
+    const allowChurn = bodyOf(req).allowChurn === true;
     // Atomic: decide + wish-state + run creation in one transaction.
     // A run-creation failure no longer strands an approved winner.
     try {
@@ -556,6 +557,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         backend,
         allowDependencies,
         String(user.id),
+        allowChurn,
       );
       return { winner: result.winner, run: result.run };
     } catch (err) {
@@ -645,6 +647,56 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const retry = await store.createRun(pool, winner.id, run.backend, true, run.id);
     await store.createJob(pool, retry.id, repo.id);
     await audit(pool, String(user.id), "run_retried_with_deps", "run", retry.id, null, {
+      previousRunId: run.id,
+    });
+    return { run: retry };
+  });
+
+  app.post("/api/runs/:id/retry-with-churn-override", async (req, reply) => {
+    const user = requireAuth(req, reply, config);
+    if (!user) return;
+    const run = await store.getRun(pool, (req.params as { id: string }).id);
+    if (!run) return reply.code(404).send({ error: "run not found" });
+    if (run.state !== "blocked") {
+      return reply.code(409).send({ error: "only blocked runs can be retried with a churn override" });
+    }
+    const winner = await store.getWinner(pool, run.winner_id);
+    if (!winner) return reply.code(404).send({ error: "winner not found" });
+    const wish = await store.getWish(pool, winner.wish_id);
+    if (!wish) return reply.code(404).send({ error: "wish not found" });
+    const repo = await store.getRepo(pool, wish.repo_id);
+    if (!repo) return reply.code(404).send({ error: "repo not found" });
+    if (!(await requireMaintainer(deps, repo, user, reply))) return;
+    // Same guards as retry-with-deps: only open/needs_input wishes
+    // with no active run qualify, so a retry can never resurrect a
+    // shipped/rejected wish or duplicate an in-flight run.
+    if (wish.state !== "open" && wish.state !== "needs_input") {
+      return reply.code(409).send({ error: `wish is ${wish.state}, cannot retry` });
+    }
+    const active = await pool.query(
+      `SELECT COUNT(*)::text AS n FROM runs
+       WHERE winner_id = $1 AND state IN ('queued','running','verifying')`,
+      [winner.id],
+    );
+    if (Number(active.rows[0].n) > 0) {
+      return reply.code(409).send({ error: "winner already has an active run" });
+    }
+    // The override is maintainer-attested, recorded on the run record
+    // (allow_churn), and audited here. It downgrades ONLY the
+    // churn-size heuristic to flagged for the retry run; the backdoor
+    // shape (unrelated file + new outbound host) still blocks, and
+    // the PR body notes the override. Non-maintainers never reach
+    // this point: requireMaintainer above refuses them.
+    const retry = await store.createRun(
+      pool,
+      winner.id,
+      run.backend,
+      run.allow_dependencies,
+      run.id,
+      true,
+    );
+    await store.createJob(pool, retry.id, repo.id);
+    await audit(pool, String(user.id), "run_retried_with_churn_override", "run", retry.id, null, {
       previousRunId: run.id,
     });
     return { run: retry };

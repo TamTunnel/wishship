@@ -16,7 +16,7 @@ import {
 function shQuote(s: string): string {
   return "'" + s.replace(/'/g, `'"'"'`) + "'";
 }
-function nodeStdin(body: string): string {
+export function nodeStdin(body: string): string {
   const script = `let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{${body}});`;
   return `node -e ${shQuote(script)}`;
 }
@@ -145,6 +145,8 @@ export interface DriveOpts {
   voterCount?: number;
   configOverrides?: Partial<store.RepoConfig>;
   appConfigOverrides?: Record<string, unknown>;
+  /** Extra fields merged into the approve payload (e.g. allowChurn). */
+  approveExtras?: Record<string, unknown>;
 }
 
 /** Full loop: submit, vote, close cycle, approve, run to terminal state. */
@@ -179,7 +181,7 @@ export async function drivePipeline(t: TestApp, opts: DriveOpts): Promise<{
   const winnerId = closed.body.winner.id as string;
   const approved = await api(t, "POST", `/api/winners/${winnerId}/approve`, {
     user: maintainer,
-    payload: { backend: "script" },
+    payload: { backend: "script", ...(opts.approveExtras ?? {}) },
   });
   if (approved.status !== 200) throw new Error(`approve failed: ${JSON.stringify(approved.body)}`);
   const runId = approved.body.run.id as string;

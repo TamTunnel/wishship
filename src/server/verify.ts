@@ -3,7 +3,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { AgentBackend, TaskSpec } from "./agent";
-import { scanSecrets } from "./secretscan";
+import { scanAddedLines } from "./secretscan";
 import type { CheckResult, RepoConfig, Tier } from "./store";
 import { addedLinesOf } from "./worktree";
 
@@ -197,21 +197,37 @@ function packageDepMap(pkgJson: string): Map<string, string> {
   }
 }
 
+export interface DependencyCheck {
+  violations: string[];
+  /**
+   * Script keys added by the patch that were absent at base. These are
+   * NOT violations: a script key that did not exist at base can never
+   * run under verification, because commands are pinned to the base
+   * discovery (see VerifyInput.commands). The addition is diff content
+   * the maintainer reviews in the draft PR. Per-key only: changes and
+   * removals of keys that exist at base still block.
+   */
+  exemptedScripts: string[];
+}
+
 /**
  * Compare dependency manifests at the base commit vs. the verified tree.
  * Any lockfile change, dependency add/remove/VERSION change, script
- * change, or build-file (Makefile) change is a violation (BLOCKED by
- * default; the maintainer may allow a retry with dependencies permitted
- * for that run). Nested manifests (e.g. packages/foo/package.json,
- * subdir/requirements.txt) are walked too — only the root used to be.
+ * change or removal, or build-file (Makefile) change is a violation
+ * (BLOCKED by default; the maintainer may allow a retry with
+ * dependencies permitted for that run). Script ADDITIONS of keys absent
+ * at base are exempted (see DependencyCheck.exemptedScripts). Nested
+ * manifests (e.g. packages/foo/package.json, subdir/requirements.txt)
+ * are walked too — only the root used to be.
  */
 export async function detectDependencyChanges(
   worktreeDir: string,
   baseCommit: string,
   verifyDir: string,
   filesChanged: string[],
-): Promise<string[]> {
+): Promise<DependencyCheck> {
   const violations: string[] = [];
+  const exemptedScripts: string[] = [];
   for (const f of filesChanged) {
     const base = f.split("/").pop() ?? f;
     if (LOCKFILES.has(base)) violations.push(`lockfile changed: ${f}`);
@@ -233,11 +249,11 @@ export async function detectDependencyChanges(
       const afterMap = after ? packageDepMap(after) : new Map<string, string>();
       for (const [k, v] of afterMap) {
         if (!beforeMap.has(k)) {
-          violations.push(
-            k.startsWith("script:")
-              ? `script added: ${k.slice(7)} (${f})`
-              : `dependency added: ${k} (${f})`,
-          );
+          if (k.startsWith("script:")) {
+            exemptedScripts.push(`${k.slice(7)} (${f})`);
+            continue;
+          }
+          violations.push(`dependency added: ${k} (${f})`);
         } else if (beforeMap.get(k) !== v) {
           violations.push(
             k.startsWith("script:")
@@ -259,7 +275,7 @@ export async function detectDependencyChanges(
       violations.push(`manifest changed: ${f}`);
     }
   }
-  return violations;
+  return { violations, exemptedScripts };
 }
 
 // ---------- churn heuristic ----------
@@ -466,6 +482,13 @@ export interface VerifyInput {
   addedLines: number;
   config: RepoConfig;
   allowDependencies: boolean;
+  /**
+   * Maintainer-attested churn override (see the churn check below):
+   * the maintainer judged the unrelated files legitimate. Downgrades
+   * the churn-SIZE block to flagged; it never permits the backdoor
+   * shape (unrelated file + new outbound host), which stays failed.
+   */
+  allowChurn?: boolean;
   backend: AgentBackend;
   /** Hosts present in the BASE tree (collected before the patch lands). */
   baselineHosts: Set<string>;
@@ -492,6 +515,42 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
   // from the patched tree (see VerifyInput.commands).
   const commands = input.commands;
 
+  // FAIL FAST on dependency/manifest violations, BEFORE any check
+  // command executes. The old order ran the tests first: a pinned
+  // command string like `make test` still dispatches to the PATCHED
+  // Makefile, so an agent rewriting the test recipe got its recipe
+  // executed in the verify worktree (the marker file existed after a
+  // BLOCKED run). Package.json rewrites never executed because the
+  // command string itself is pinned, but make is different — and
+  // check output lands in run records served by unauthenticated GET
+  // /api/runs/:id, so a recipe printing /proc environ would leak
+  // service secrets into a publicly readable record. Computing the
+  // violations first needs only file reads, no command execution.
+  // When the maintainer permitted dependencies for this run, the
+  // violations are flagged, not failed, and checks run as before.
+  const depResult = await detectDependencyChanges(
+    input.agentWorktreeDir,
+    input.baseCommit,
+    verifyDir,
+    input.filesChanged,
+  );
+  if (depResult.violations.length > 0 && !input.allowDependencies) {
+    checks.push({
+      name: "dependencies",
+      status: "failed",
+      detail: `dependency changes blocked by default: ${depResult.violations.join("; ")}`,
+    });
+    for (const name of ["tests", "lint", "typecheck"] as const) {
+      checks.push({
+        name,
+        status: "skipped",
+        detail:
+          "not executed: dependency violations fail verification before any check command runs",
+      });
+    }
+    return { tier: "BLOCKED", checks };
+  }
+
   // Tests (if present). No discoverable command -> PARTIAL, not BLOCKED.
   if (commands.test) {
     const r = await runShell(commands.test, verifyDir);
@@ -507,7 +566,7 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
     checks.push({
       name: "tests",
       status: "skipped",
-      detail: "no test suite discovered (no-test-suite); PR opens as PARTIAL",
+      detail: "no test command discovered from the base tree (no-test-suite); PR opens as PARTIAL",
     });
   }
 
@@ -545,12 +604,11 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
     });
   }
 
-  // Secret scan on added lines (the whole diff, not just claimed files).
+  // Secret scan on added lines (the whole diff, not just claimed
+  // files). Joined + concatenation-aware: a token split across lines
+  // or rebuilt with `+` from quoted fragments is still caught.
   const added = addedLinesOf(input.patch);
-  const secretHits = new Set<string>();
-  for (const line of added) {
-    for (const h of scanSecrets(line)) secretHits.add(h);
-  }
+  const secretHits = new Set<string>(scanAddedLines(added));
   checks.push({
     name: "secret_scan",
     status: secretHits.size === 0 ? "passed" : "failed",
@@ -572,6 +630,10 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
   // Unrelated churn. An unrelated file that phones a NEW host upgrades
   // the churn check to failed: that is the backdoor shape (unrelated
   // code + exfiltration), and it must not reach VERIFIED on flags alone.
+  // A maintainer churn override (allowChurn) downgrades ONLY the
+  // size heuristic to flagged: the maintainer attested the unrelated
+  // files are legitimate, and the PR body notes the override. It never
+  // permits the backdoor shape, which stays failed.
   const churn = assessChurn(
     input.patch,
     input.filesChanged,
@@ -582,7 +644,8 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
   const backdoorFiles = churn.unrelatedFiles.filter(
     (f) => newHostsInFile(perFile.get(f) ?? [], input.baselineHosts).length > 0,
   );
-  const churnFailed = churn.blocked || backdoorFiles.length > 0;
+  const churnSizeOverridden = input.allowChurn === true && churn.blocked;
+  const churnFailed = (churn.blocked && !churnSizeOverridden) || backdoorFiles.length > 0;
   checks.push({
     name: "churn",
     status: churnFailed
@@ -593,18 +656,16 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
     detail:
       backdoorFiles.length > 0
         ? `unrelated files with new outbound calls: ${backdoorFiles.join(", ")}`
-        : churn.unrelatedFiles.length === 0
-          ? "all changed files relate to the wish"
-          : `unrelated files: ${churn.unrelatedFiles.join(", ")} (${churn.unrelatedAddedLines} lines)`,
+        : churnSizeOverridden
+          ? `churn override permitted for this run (maintainer attested legitimate): unrelated files: ${churn.unrelatedFiles.join(", ")} (${churn.unrelatedAddedLines} lines)`
+          : churn.unrelatedFiles.length === 0
+            ? "all changed files relate to the wish"
+            : `unrelated files: ${churn.unrelatedFiles.join(", ")} (${churn.unrelatedAddedLines} lines)`,
   });
 
-  // Dependency rules: BLOCKED by default.
-  const depViolations = await detectDependencyChanges(
-    input.agentWorktreeDir,
-    input.baseCommit,
-    verifyDir,
-    input.filesChanged,
-  );
+  // Dependency rules: BLOCKED by default. The violations were computed
+  // up top (fail-fast); this check only reports them.
+  const depViolations = depResult.violations;
   if (depViolations.length > 0) {
     checks.push({
       name: "dependencies",
@@ -617,7 +678,10 @@ export async function verifyDiff(input: VerifyInput): Promise<VerifyOutput> {
     checks.push({
       name: "dependencies",
       status: "passed",
-      detail: "no dependency or lockfile changes",
+      detail:
+        depResult.exemptedScripts.length > 0
+          ? `no dependency or lockfile changes (script additions exempted — absent at base, never executed by verification: ${depResult.exemptedScripts.join("; ")})`
+          : "no dependency or lockfile changes",
     });
   }
 

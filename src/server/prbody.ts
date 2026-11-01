@@ -11,6 +11,8 @@ export interface PrBodyInput {
   costUsd: string | null;
   runId: string;
   filesChanged: string[];
+  /** Maintainer churn override applied to this run (see verify.ts). */
+  churnOverride?: boolean;
 }
 
 /**
@@ -85,6 +87,16 @@ export function buildPrBody(input: PrBodyInput): string {
     lines.push(
       `This PR is PARTIAL: no check failed, but at least one applicable ` +
         `check could not run. See the caveats above.`,
+    );
+    lines.push(``);
+  }
+  if (input.churnOverride) {
+    lines.push(
+      `**Maintainer override:** a maintainer attested that the unrelated ` +
+        `files in this diff are legitimate for this wish, overriding the ` +
+        `churn-size block for this run. The override is recorded in the ` +
+        `run record and audit log. It does not waive the backdoor check: ` +
+        `an unrelated file with a new outbound call still blocks.`,
     );
     lines.push(``);
   }

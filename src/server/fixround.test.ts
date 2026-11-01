@@ -554,12 +554,13 @@ describe("fix round: secrets and PR bodies (M2, M3)", () => {
       }),
     );
     await writeFile(join(verifyDir, "requirements.txt"), "flask==3.0\n");
-    const violations = await detectDependencyChanges(
+    const result = await detectDependencyChanges(
       fixture.dir,
       fixture.commit,
       verifyDir,
       ["package.json", "requirements.txt"],
     );
+    const violations = result.violations;
     assert.ok(
       violations.some((v) => /dependency version changed: dependencies:left-pad \^1\.0\.0 -> \^2\.0\.0/.test(v)),
       `missing version-change violation: ${violations.join("; ")}`,

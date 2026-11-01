@@ -27,8 +27,41 @@ vote → approve → build → verify → review → ship.
 5. **Verification (the moat).** Deterministic checks run on a clean checkout with the diff
    applied: the repo's own tests, lint, typecheck, secret scan, diff-size limit, churn check,
    dependency rules, new-network-call flagging, and an advisory second-model review.
+   **Ordering matters:** dependency/manifest violations are computed FIRST, and when they
+   fail, no check command executes at all. The old order ran the tests first — and a pinned
+   command string like `make test` still dispatches to the PATCHED Makefile, so an agent
+   rewriting the test recipe got its recipe executed during verification. Fail-fast closes
+   that hole; it also keeps check output (which lands in run records served by
+   unauthenticated `GET /api/runs/:id`) free of anything a hostile recipe could print.
+   Two maintainer escapes exist for honest blocks, both audited: **retry-with-deps**
+   (dependency changes permitted for that run) and **churn override** (see below).
 6. **Draft PR (human gate 2).** Only `VERIFIED` or `PARTIAL` reports open a PR, and it opens
    as a **draft** carrying the full report. The maintainer reviews, merges, or closes it.
+
+### Verification details worth knowing
+
+- **Script additions are not violations.** If the agent adds a `package.json` script key
+  that did not exist at base, that addition is exempted per-key: it can never run under
+  verification, because check commands are pinned to the base discovery. The addition is
+  diff content the maintainer reviews in the draft PR. Changing or removing a script key
+  that exists at base still blocks, as do dependency adds and lockfile changes.
+- **Split tokens are caught.** The secret scan covers the whole added-lines text joined
+  together plus actual join operations in the diff (`a + b` with both sides resolved
+  through same-diff assignments, and template literals). A token split across lines or
+  rebuilt from quoted fragments fails the scan. Mere adjacency without a join operator
+  is NOT flagged: concatenating neighboring literals fabricated tokens that do not exist
+  in the source (it once blocked a JSON env dump, where `"1"` + `"PATH"` + the PATH
+  value formed a 40-character slash run tripping the AWS-secret shape).
+- **Churn override (maintainer-only, audited).** When a run blocks ONLY on the churn-size
+  heuristic — e.g. a legitimate 30-line helper with no relation to the wish — the
+  maintainer can attest the unrelated files are legitimate, either up front
+  (`allowChurn` on approve) or after the block
+  (`POST /api/runs/:id/retry-with-churn-override`). The override is recorded on the run
+  record (`allow_churn`), audited (`run_retried_with_churn_override`), and noted in the
+  PR body. It downgrades ONLY the size heuristic to flagged: an unrelated file with a
+  new outbound call (the backdoor shape) still blocks, and non-maintainers are refused
+  (403). The automatic retry runs first, so the override applies once that retry has
+  also blocked and the wish is back in `open`.
 
 ## Honest limits — read these before you trust a WishShip PR
 

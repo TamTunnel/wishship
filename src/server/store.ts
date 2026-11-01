@@ -134,6 +134,7 @@ export interface Run {
   duration_ms: number | null;
   cost_usd: string | null;
   allow_dependencies: boolean;
+  allow_churn: boolean;
   failure_reason: string | null;
   retry_of: string | null;
   created_at: Date;
@@ -567,12 +568,13 @@ export async function createRun(
   backend: string,
   allowDependencies: boolean,
   retryOf: string | null = null,
+  allowChurn: boolean = false,
 ): Promise<Run> {
   const row = await queryOne<Run>(
     pool,
-    `INSERT INTO runs (winner_id, backend, allow_dependencies, retry_of)
-     VALUES ($1, $2, $3, $4) RETURNING *`,
-    [winnerId, backend, allowDependencies, retryOf],
+    `INSERT INTO runs (winner_id, backend, allow_dependencies, retry_of, allow_churn)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [winnerId, backend, allowDependencies, retryOf, allowChurn],
   );
   if (!row) throw new Error("createRun failed");
   return row;

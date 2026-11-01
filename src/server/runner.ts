@@ -88,6 +88,7 @@ export async function createRunForWinner(
   backend: string,
   allowDependencies: boolean,
   actorId: string,
+  allowChurn: boolean = false,
 ): Promise<Run> {
   const client = await pool.connect();
   try {
@@ -119,6 +120,8 @@ export async function createRunForWinner(
       winnerId,
       backend,
       allowDependencies,
+      null,
+      allowChurn,
     );
     const cycle = await client.query(
       `SELECT repo_id FROM cycles WHERE id = $1`,
@@ -151,6 +154,7 @@ export async function approveWinnerAndCreateRun(
   backend: string,
   allowDependencies: boolean,
   actorId: string,
+  allowChurn: boolean = false,
 ): Promise<{ winner: store.CycleWinner; wish: store.Wish; run: Run }> {
   const client = await pool.connect();
   try {
@@ -183,7 +187,7 @@ export async function approveWinnerAndCreateRun(
     if (Number(active.rows[0].n) > 0) {
       throw new RunFailure("winner already has an active run");
     }
-    const run = await store.createRun(client, winnerId, backend, allowDependencies);
+    const run = await store.createRun(client, winnerId, backend, allowDependencies, null, allowChurn);
     const cycle = await client.query(
       `SELECT repo_id FROM cycles WHERE id = $1`,
       [winner.cycle_id],
@@ -284,6 +288,7 @@ export async function openPrForRun(
     costUsd: run.cost_usd,
     runId: run.id,
     filesChanged: [...addedLinesPerFile(patch).keys()],
+    churnOverride: run.allow_churn,
   });
   const pr = await github.openPr(
     repo.installation_id,
@@ -418,6 +423,7 @@ export class Worker {
         oldRun.backend,
         oldRun.allow_dependencies,
         oldRun.id,
+        oldRun.allow_churn,
       );
       await store.createJob(pool, retry.id, row.repo_id, row.attempts);
       await audit(pool, "system", "run_recovered_after_crash", "run", retry.id, null, {
@@ -602,6 +608,7 @@ export class Worker {
         addedLines: captured.addedLines,
         config: repo.config,
         allowDependencies: run.allow_dependencies,
+        allowChurn: run.allow_churn,
         backend,
         baselineHosts,
         outsideWrites,
@@ -637,6 +644,7 @@ export class Worker {
             run.backend,
             run.allow_dependencies,
             run.id,
+            run.allow_churn,
           );
           await store.createJob(pool, retry.id, repoId);
           await audit(pool, "system", "run_blocked_retry_queued", "run", runId, null, {

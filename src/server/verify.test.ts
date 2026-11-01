@@ -132,16 +132,19 @@ describe("verification pipeline (probes 8, 9, 10, 15)", () => {
       wishTitle: "Dark mode",
       wishBody: "Add a dark mode toggle.",
     });
-    // The pre-agent test command (node theme.test.js) still runs and
-    // passes, but the script change itself is a violation: BLOCKED,
-    // no PR, and the planted marker never proves anything.
+    // Fail-fast (fix round 2): the script change is a dependency
+    // violation, so verification BLOCKS before ANY check command runs.
+    // The pre-agent command string is still pinned, but it is never
+    // executed — the old behavior ran the tests first, which is what
+    // let a rewritten Makefile recipe execute (see the Makefile test).
     assert.equal(out.run.state, "blocked");
     const deps = out.report?.checks.find((c) => c.name === "dependencies");
     assert.equal(deps?.status, "failed");
     assert.match(deps?.detail ?? "", /script changed: test/);
     assert.equal(t.github.openedPrs.length, 0);
     const tests = out.report?.checks.find((c) => c.name === "tests");
-    assert.match(tests?.detail ?? "", /node theme\.test\.js/);
+    assert.equal(tests?.status, "skipped");
+    assert.match(tests?.detail ?? "", /not executed/);
   });
 
   test("tiers: no-test-suite repo gets PARTIAL with the no-test-suite label, not blocked", async () => {
