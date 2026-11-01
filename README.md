@@ -64,7 +64,11 @@ vote → approve → build → verify → review → ship.
   16, branch order), and `+`, `concat`, `join`, string methods, member/index
   reads, template substitutions, and `String`/`atob`/decoder calls distribute
   over the set — so a branchy helper's fragments combined with further
-  expressions at the call site are caught. A token split across lines
+  expressions at the call site are caught. Spread arguments are expanded
+  per argument-list variant, so a spread of a branchy (set-valued) array
+  into a variadic builtin like `String.fromCharCode()` expands to the
+  individual codes per branch instead of collapsing to one unknown
+  argument. A token split across lines
   or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
   operator is NOT flagged: concatenating neighboring literals fabricated tokens
   that do not exist in the source (it once blocked a JSON env dump, where `"1"`

@@ -167,6 +167,13 @@ export function scanSecrets(text: string): string[] {
  *   distribute through the replacement; array `slice` and `reverse`
  *   are modeled (slice on arrays was also unmodeled before round 7,
  *   so a slice().reverse() chain died at slice()).
+ * - spread argument-list variants (round 8): a spread of a
+ *   set-valued array fans out to one argument list per member
+ *   array, because a spread changes arity and a single flat list
+ *   cannot represent "one of these argument lists" — without this,
+ *   `String.fromCharCode(...pickCodes(flag))` collapsed to one set
+ *   argument that the per-code distribution saw as an array and
+ *   gave up on. Spread of a non-array stays a single argument.
  *
  * Deliberately NOT modeled (stays unknown, never flagged alone):
  * - recursion, closures over mutated state, classes, `eval`, and
@@ -1132,8 +1139,13 @@ class Parser {
       // additionally flags secrets among the outcomes themselves.
       if (v !== null && v.kind === "function" && this.peekPunct("(")) {
         this.pos++;
-        const args = this.parseArgs();
-        const outs = evaluateFunction(v.def, args, this.env, this.ctx);
+        const def = v.def;
+        // Round 8: evaluate per argument-list variant, so a spread
+        // of a set-valued array binds each variant's items as the
+        // parameters instead of collapsing to one set argument.
+        const outs = this.parseArgsVariants().flatMap((args) =>
+          evaluateFunction(def, args, this.env, this.ctx),
+        );
         v = makeSet(outs);
         continue;
       }
@@ -1186,32 +1198,35 @@ class Parser {
             (member.v === "fromCharCode" || member.v === "fromCodePoint")
           ) {
             this.pos += 3;
-            const args = this.parseArgs();
-            // Round 7: set arguments distribute (cross product of the
-            // code options, capped by distribute); a combination with
-            // an unresolvable code drops, never fabricates.
-            const out = distribute(args, (concrete) => {
-              const codes: number[] = [];
-              for (const a of concrete) {
-                if (a !== null && a.kind === "number") {
-                  codes.push(a.value);
-                } else if (a !== null && a.kind === "string" && /^-?\d+$/.test(a.value.trim())) {
-                  codes.push(parseInt(a.value.trim(), 10));
-                } else {
+            // Round 8: evaluate per argument-list variant, so a
+            // spread of a set-valued array expands to individual
+            // code arguments per variant (previously the spread
+            // set collapsed to one argument, which the per-code
+            // distribution saw as an array and gave up on).
+            const out = this.evalArgVariants((args) =>
+              distribute(args, (concrete) => {
+                const codes: number[] = [];
+                for (const a of concrete) {
+                  if (a !== null && a.kind === "number") {
+                    codes.push(a.value);
+                  } else if (a !== null && a.kind === "string" && /^-?\d+$/.test(a.value.trim())) {
+                    codes.push(parseInt(a.value.trim(), 10));
+                  } else {
+                    return null;
+                  }
+                }
+                try {
+                  return {
+                    kind: "string",
+                    value: member.v === "fromCharCode"
+                      ? String.fromCharCode(...codes)
+                      : String.fromCodePoint(...codes),
+                  };
+                } catch {
                   return null;
                 }
-              }
-              try {
-                return {
-                  kind: "string",
-                  value: member.v === "fromCharCode"
-                    ? String.fromCharCode(...codes)
-                    : String.fromCodePoint(...codes),
-                };
-              } catch {
-                return null;
-              }
-            });
+              }),
+            );
             if (out === null) return null;
             v = out;
             continue;
@@ -1223,37 +1238,40 @@ class Parser {
             member.v === "from"
           ) {
             this.pos += 3;
-            const args = this.parseArgs();
             // Round 7: set data / encoding arguments distribute, so
             // Buffer.from over a branchy value decodes each member.
+            // Round 8: per argument-list variant, so a spread of a
+            // set-valued [data, encoding] pair expands correctly.
             const encDefault: Value = { kind: "string", value: "utf8" };
-            const out = distribute(
-              [args[0] ?? null, args[1] === undefined ? encDefault : args[1]],
-              (concrete) => {
-                const [d, e] = concrete;
-                if (d === undefined || d === null || d.kind !== "string") return null;
-                const enc = coerceToString(e);
-                if (enc === null) return null;
-                if (enc === "base64" || enc === "base64url") {
-                  const decoded = decodeBase64(d.value, enc === "base64url");
-                  if (decoded === null) return null;
-                  return { kind: "string", value: decoded };
-                }
-                if (
-                  enc === "utf8" || enc === "utf-8" || enc === "ascii" ||
-                  enc === "latin1" || enc === "binary"
-                ) {
-                  return { kind: "string", value: d.value };
-                }
-                if (enc === "hex") {
-                  try {
-                    return { kind: "string", value: Buffer.from(d.value, "hex").toString("latin1") };
-                  } catch {
-                    return null;
+            const out = this.evalArgVariants((args) =>
+              distribute(
+                [args[0] ?? null, args[1] === undefined ? encDefault : args[1]],
+                (concrete) => {
+                  const [d, e] = concrete;
+                  if (d === undefined || d === null || d.kind !== "string") return null;
+                  const enc = coerceToString(e);
+                  if (enc === null) return null;
+                  if (enc === "base64" || enc === "base64url") {
+                    const decoded = decodeBase64(d.value, enc === "base64url");
+                    if (decoded === null) return null;
+                    return { kind: "string", value: decoded };
                   }
-                }
-                return null;
-              },
+                  if (
+                    enc === "utf8" || enc === "utf-8" || enc === "ascii" ||
+                    enc === "latin1" || enc === "binary"
+                  ) {
+                    return { kind: "string", value: d.value };
+                  }
+                  if (enc === "hex") {
+                    try {
+                      return { kind: "string", value: Buffer.from(d.value, "hex").toString("latin1") };
+                    } catch {
+                      return null;
+                    }
+                  }
+                  return null;
+                },
+              ),
             );
             if (out === null) return null;
             v = out;
@@ -1269,42 +1287,50 @@ class Parser {
             (member.v === "from" || member.v === "of")
           ) {
             this.pos += 3;
-            const args = this.parseArgs();
             const toByte = (n: number): number => ((Math.trunc(n) % 256) + 256) % 256;
             if (member.v === "of") {
               // Round 7: set arguments distribute over the byte list.
-              const out = distribute(args, (concrete) => {
-                const bytes: number[] = [];
-                for (const a of concrete) {
-                  const n = a === null ? null : toNum(a);
-                  if (n === null) return null;
-                  bytes.push(toByte(n));
-                }
-                return { kind: "array", items: bytes.map((b) => ({ kind: "number" as const, value: b })) };
-              });
-              if (out === null) return null;
-              v = out;
-            } else {
-              if (args.length > 1 && args[1] !== undefined) return null;
-              // Round 7: a set source decodes member by member.
-              const out = mapSetValues(args[0] ?? null, (src) => {
-                if (src === undefined || src === null) return null;
-                if (src.kind === "array") {
+              // Round 8: per argument-list variant, so a spread of a
+              // set-valued byte array expands to individual bytes.
+              const out = this.evalArgVariants((args) =>
+                distribute(args, (concrete) => {
                   const bytes: number[] = [];
-                  for (const it of src.items) {
-                    const n = toNum(it);
+                  for (const a of concrete) {
+                    const n = a === null ? null : toNum(a);
                     if (n === null) return null;
                     bytes.push(toByte(n));
                   }
                   return { kind: "array", items: bytes.map((b) => ({ kind: "number" as const, value: b })) };
-                }
-                if (src.kind === "string") {
-                  return {
-                    kind: "array",
-                    items: [...Buffer.from(src.value, "utf8")].map((b) => ({ kind: "number" as const, value: b })),
-                  };
-                }
-                return null;
+                }),
+              );
+              if (out === null) return null;
+              v = out;
+            } else {
+              // Round 8: per argument-list variant; a variant with a
+              // second (mapFn) argument contributes nothing, as
+              // before, instead of killing the other variants.
+              const out = this.evalArgVariants((args) => {
+                if (args.length > 1 && args[1] !== undefined) return null;
+                // Round 7: a set source decodes member by member.
+                return mapSetValues(args[0] ?? null, (src) => {
+                  if (src === undefined || src === null) return null;
+                  if (src.kind === "array") {
+                    const bytes: number[] = [];
+                    for (const it of src.items) {
+                      const n = toNum(it);
+                      if (n === null) return null;
+                      bytes.push(toByte(n));
+                    }
+                    return { kind: "array", items: bytes.map((b) => ({ kind: "number" as const, value: b })) };
+                  }
+                  if (src.kind === "string") {
+                    return {
+                      kind: "array",
+                      items: [...Buffer.from(src.value, "utf8")].map((b) => ({ kind: "number" as const, value: b })),
+                    };
+                  }
+                  return null;
+                });
               });
               if (out === null) return null;
               v = out;
@@ -1323,15 +1349,18 @@ class Parser {
             member.v === "parse"
           ) {
             this.pos += 3;
-            const args = this.parseArgs();
-            const out = mapSetValues(args[0] ?? null, (data) => {
-              if (data === undefined || data === null || data.kind !== "string") return null;
-              try {
-                return jsonToValue(JSON.parse(data.value), 0);
-              } catch {
-                return null;
-              }
-            });
+            // Round 8: per argument-list variant (a spread of a
+            // set-valued [json] pair expands correctly).
+            const out = this.evalArgVariants((args) =>
+              mapSetValues(args[0] ?? null, (data) => {
+                if (data === undefined || data === null || data.kind !== "string") return null;
+                try {
+                  return jsonToValue(JSON.parse(data.value), 0);
+                } catch {
+                  return null;
+                }
+              }),
+            );
             if (out === null) return null;
             v = out;
             continue;
@@ -1346,41 +1375,48 @@ class Parser {
             (member.v === "from" || member.v === "of")
           ) {
             this.pos += 3;
-            const args = this.parseArgs();
+            // Round 8: per argument-list variant, so a spread of a
+            // set-valued array expands to individual elements for
+            // `of`, and a spread [source, mapFn] pair splits
+            // correctly for `from`.
             if (member.v === "of") {
-              v = { kind: "array", items: args };
+              const out = this.evalArgVariants((args) => ({ kind: "array", items: args }) as Value);
+              if (out === null) return null;
+              v = out;
               continue;
             }
-            const src = args[0];
-            // Round 7: a set source maps member by member to a set
-            // of arrays, so later operations distribute over them.
-            const out = mapSetValues(src ?? null, (s) => {
-              if (s === undefined || s === null) return null;
-              let items: Value[];
-              if (s.kind === "array") items = [...s.items];
-              else if (s.kind === "string") {
-                items = [...s.value].map((ch) => ({ kind: "string" as const, value: ch }));
-              } else {
-                return null;
-              }
-              const mapFn = args[1];
-              if (mapFn !== undefined) {
-                if (mapFn === null || mapFn.kind !== "function") return null;
-                const mapped: Value[] = [];
-                for (let idx = 0; idx < items.length; idx++) {
-                  const outs = evaluateFunction(
-                    mapFn.def,
-                    [items[idx], { kind: "number", value: idx }],
-                    this.env,
-                    this.ctx,
-                  );
-                  // Multi-path map results become a set item (round 6b)
-                  // rather than killing the whole Array.from.
-                  mapped.push(makeSet(outs));
+            const out = this.evalArgVariants((args) => {
+              const src = args[0];
+              // Round 7: a set source maps member by member to a set
+              // of arrays, so later operations distribute over them.
+              return mapSetValues(src ?? null, (s) => {
+                if (s === undefined || s === null) return null;
+                let items: Value[];
+                if (s.kind === "array") items = [...s.items];
+                else if (s.kind === "string") {
+                  items = [...s.value].map((ch) => ({ kind: "string" as const, value: ch }));
+                } else {
+                  return null;
                 }
-                items = mapped;
-              }
-              return { kind: "array", items };
+                const mapFn = args[1];
+                if (mapFn !== undefined) {
+                  if (mapFn === null || mapFn.kind !== "function") return null;
+                  const mapped: Value[] = [];
+                  for (let idx = 0; idx < items.length; idx++) {
+                    const outs = evaluateFunction(
+                      mapFn.def,
+                      [items[idx], { kind: "number", value: idx }],
+                      this.env,
+                      this.ctx,
+                    );
+                    // Multi-path map results become a set item (round 6b)
+                    // rather than killing the whole Array.from.
+                    mapped.push(makeSet(outs));
+                  }
+                  items = mapped;
+                }
+                return { kind: "array", items };
+              });
             });
             if (out === null) return null;
             v = out;
@@ -1388,8 +1424,10 @@ class Parser {
           }
           if (member.v === "concat" || member.v === "join") {
             this.pos += 3;
-            const args = this.parseArgs();
-            const out = distribute([v, ...args], (concrete) => {
+            // Round 8: per argument-list variant, so a spread of a
+            // set-valued array expands to individual elements.
+            const out = this.evalArgVariants((args) =>
+              distribute([v, ...args], (concrete) => {
               const [rv, ...rest] = concrete;
               if (member.v === "concat") {
                 if (rv === null) return null;
@@ -1450,7 +1488,7 @@ class Parser {
               return makeSet(
                 combos.map((c) => ({ kind: "string" as const, value: c.join(sep) })),
               );
-            });
+            }));
             if (out === null) return null;
             v = out;
             continue;
@@ -1461,12 +1499,14 @@ class Parser {
           // ARGUMENTS still distribute here.
           if (v !== null && v.kind === "string") {
             this.pos += 3;
-            const args = this.parseArgs();
-            const out = distribute([v, ...args], (concrete) => {
-              const [rv, ...rest] = concrete;
-              if (rv === null || rv.kind !== "string") return null;
-              return evalStringMethod(rv.value, member.v, rest, this.env, this.ctx);
-            });
+            // Round 8: per argument-list variant.
+            const out = this.evalArgVariants((args) =>
+              distribute([v, ...args], (concrete) => {
+                const [rv, ...rest] = concrete;
+                if (rv === null || rv.kind !== "string") return null;
+                return evalStringMethod(rv.value, member.v, rest, this.env, this.ctx);
+              }),
+            );
             if (out === null) return null;
             v = out;
             continue;
@@ -1477,15 +1517,17 @@ class Parser {
           if (v !== null && v.kind === "array") {
             if (member.v === "at") {
               this.pos += 3;
-              const args = this.parseArgs();
-              const out = distribute([v, ...args], (concrete) => {
-                const [rv, ...rest] = concrete;
-                if (rv === null || rv.kind !== "array") return null;
-                const idx = numArg(rest[0]);
-                if (idx === null || idx === undefined) return null;
-                const item = rv.items[idx];
-                return item === undefined ? null : item;
-              });
+              // Round 8: per argument-list variant.
+              const out = this.evalArgVariants((args) =>
+                distribute([v, ...args], (concrete) => {
+                  const [rv, ...rest] = concrete;
+                  if (rv === null || rv.kind !== "array") return null;
+                  const idx = numArg(rest[0]);
+                  if (idx === null || idx === undefined) return null;
+                  const item = rv.items[idx];
+                  return item === undefined ? null : item;
+                }),
+              );
               if (out === null) return null;
               v = out;
               continue;
@@ -1507,11 +1549,17 @@ class Parser {
             // array simply keeps the old order, a miss, not a flag).
             if (member.v === "slice") {
               this.pos += 3;
-              const args = this.parseArgs();
-              const start = numArg(args[0]);
-              const end = numArg(args[1]);
-              if (start === null || end === null) return null;
-              v = { kind: "array", items: v.items.slice(start ?? 0, end) };
+              // Round 8: per argument-list variant; a variant with
+              // unresolvable bounds contributes nothing.
+              const out = this.evalArgVariants((args) => {
+                if (v === null || v.kind !== "array") return null;
+                const start = numArg(args[0]);
+                const end = numArg(args[1]);
+                if (start === null || end === null) return null;
+                return { kind: "array", items: v.items.slice(start ?? 0, end) } as Value;
+              });
+              if (out === null) return null;
+              v = out;
               continue;
             }
             if (member.v === "reverse") {
@@ -1527,31 +1575,35 @@ class Parser {
           // arrays / strings distributes over its members (round 6b).
           if (v !== null && v.kind === "textdecoder" && member.v === "decode") {
             this.pos += 3;
-            const args = this.parseArgs();
-            const out = mapSetValues(args[0] ?? null, (data) => {
-              if (data === undefined || data === null || data.kind !== "array") return null;
-              const bytes: number[] = [];
-              for (const it of data.items) {
-                const n = toNum(it);
-                if (n === null) return null;
-                bytes.push(((Math.trunc(n) % 256) + 256) % 256);
-              }
-              return { kind: "string", value: Buffer.from(bytes).toString("utf8") };
-            });
+            // Round 8: per argument-list variant.
+            const out = this.evalArgVariants((args) =>
+              mapSetValues(args[0] ?? null, (data) => {
+                if (data === undefined || data === null || data.kind !== "array") return null;
+                const bytes: number[] = [];
+                for (const it of data.items) {
+                  const n = toNum(it);
+                  if (n === null) return null;
+                  bytes.push(((Math.trunc(n) % 256) + 256) % 256);
+                }
+                return { kind: "string", value: Buffer.from(bytes).toString("utf8") };
+              }),
+            );
             if (out === null) return null;
             v = out;
             continue;
           }
           if (v !== null && v.kind === "textencoder" && member.v === "encode") {
             this.pos += 3;
-            const args = this.parseArgs();
-            const out = mapSetValues(args[0] ?? null, (data) => {
-              if (data === undefined || data === null || data.kind !== "string") return null;
-              return {
-                kind: "array",
-                items: [...Buffer.from(data.value, "utf8")].map((b) => ({ kind: "number" as const, value: b })),
-              };
-            });
+            // Round 8: per argument-list variant.
+            const out = this.evalArgVariants((args) =>
+              mapSetValues(args[0] ?? null, (data) => {
+                if (data === undefined || data === null || data.kind !== "string") return null;
+                return {
+                  kind: "array",
+                  items: [...Buffer.from(data.value, "utf8")].map((b) => ({ kind: "number" as const, value: b })),
+                };
+              }),
+            );
             if (out === null) return null;
             v = out;
             continue;
@@ -1563,8 +1615,11 @@ class Parser {
             const fn = v.props.get(member.v);
             if (fn !== undefined && fn !== null && fn.kind === "function") {
               this.pos += 3;
-              const args = this.parseArgs();
-              const outs = evaluateFunction(fn.def, args, this.env, this.ctx);
+              // Round 8: per argument-list variant, as for bare
+              // diff-defined calls above.
+              const outs = this.parseArgsVariants().flatMap((args) =>
+                evaluateFunction(fn.def, args, this.env, this.ctx),
+              );
               v = makeSet(outs);
               continue;
             }
@@ -1641,9 +1696,12 @@ class Parser {
     return j;
   }
 
-  /** Parses `(args)` with pos just after `(`; consumes through `)`. */
-  parseArgs(): Value[] {
-    const args: Value[] = [];
+  /** Parses `(args)` with pos just after `(`; consumes through `)`.
+   *  Returns each argument with its spread flag, without expanding
+   *  arity: a spread argument keeps its whole value here — arity
+   *  expansion happens in parseArgs / parseArgsVariants. */
+  parseArgsRaw(): { value: Value; spread: boolean }[] {
+    const args: { value: Value; spread: boolean }[] = [];
     if (this.peekPunct(")")) {
       this.pos++;
       return args;
@@ -1651,11 +1709,9 @@ class Parser {
     while (!this.atEnd()) {
       if (this.peekPunct("...")) {
         this.pos++;
-        const v = this.parseExpr();
-        if (v !== null && v.kind === "array") args.push(...v.items);
-        else args.push(v);
+        args.push({ value: this.parseExpr(), spread: true });
       } else {
-        args.push(this.parseExpr());
+        args.push({ value: this.parseExpr(), spread: false });
       }
       if (this.peekPunct(",")) {
         this.pos++;
@@ -1668,6 +1724,74 @@ class Parser {
       break;
     }
     return args;
+  }
+
+  /** Flat argument list with the historical semantics: spread of an
+   *  array inlines its items; anything else (including a spread
+   *  set) stays a single argument. */
+  parseArgs(): Value[] {
+    const args: Value[] = [];
+    for (const a of this.parseArgsRaw()) {
+      if (a.spread && a.value !== null && a.value.kind === "array") {
+        args.push(...a.value.items);
+      } else {
+        args.push(a.value);
+      }
+    }
+    return args;
+  }
+
+  /** Argument-list variants (round 8): a spread of a set-valued
+   *  array fans out — one variant per member array, its items
+   *  inlined — because a spread changes arity, and a single flat
+   *  list cannot represent "one of these argument lists". That was
+   *  the fromCharCode/fromCodePoint gap: a spread set collapsed to
+   *  one set argument, which the per-argument distribution then
+   *  saw as an array where it expected a number and gave up.
+   *  Spread of a non-array stays a single argument (the historical
+   *  fail-closed behavior: a spread string is not exploded into
+   *  chars, so single-arg builtins like atob keep distributing
+   *  over the whole string). Total variants are capped at 256
+   *  (the join cross-product precedent); past the cap a variant
+   *  is missed, never fabricated. */
+  parseArgsVariants(): Value[][] {
+    const MAX_VARIANTS = 256;
+    let variants: Value[][] = [[]];
+    for (const a of this.parseArgsRaw()) {
+      if (!a.spread) {
+        for (const v of variants) v.push(a.value);
+        continue;
+      }
+      if (a.value !== null && a.value.kind === "array") {
+        for (const v of variants) v.push(...a.value.items);
+        continue;
+      }
+      if (a.value !== null && a.value.kind === "set") {
+        const next: Value[][] = [];
+        for (const v of variants) {
+          for (const m of a.value.values) {
+            if (next.length >= MAX_VARIANTS) break;
+            if (m !== null && m.kind === "array") next.push([...v, ...m.items]);
+            else next.push([...v, m]);
+          }
+          if (next.length >= MAX_VARIANTS) break;
+        }
+        variants = next;
+        continue;
+      }
+      for (const v of variants) v.push(a.value);
+    }
+    return variants;
+  }
+
+  /** Evaluate `fn` over each argument-list variant (pos just after
+   *  `(`), combining the per-variant results with makeSet. A
+   *  variant that yields null contributes nothing; all-null yields
+   *  null, matching the single-list behavior. */
+  evalArgVariants(fn: (args: Value[]) => Value): Value {
+    const outs: Value[] = [];
+    for (const args of this.parseArgsVariants()) outs.push(fn(args));
+    return makeSet(outs);
   }
 
   /** Parse an arrow-function body starting at `bodyStart`; null if unparseable. */
@@ -1811,32 +1935,37 @@ class Parser {
         this.peekPunct("(")
       ) {
         this.pos++;
-        const args = this.parseArgs();
+        // Round 8: per argument-list variant, so a spread of a
+        // set-valued array expands correctly here too.
         if (tok.v === "String") {
-          if (args.length === 0) return { kind: "string", value: "" };
-          return mapSetValues(args[0], (a) => {
-            const s = coerceToString(a);
-            return s === null ? null : { kind: "string", value: s };
+          return this.evalArgVariants((args) => {
+            if (args.length === 0) return { kind: "string", value: "" };
+            return mapSetValues(args[0], (a) => {
+              const s = coerceToString(a);
+              return s === null ? null : { kind: "string", value: s };
+            });
           });
         }
-        const data = args[0];
-        if (data === undefined) return null;
-        return mapSetValues(data, (d) => {
-          if (d === null || d.kind !== "string") return null;
-          if (tok.v === "atob") {
-            const decoded = decodeBase64(d.value, false);
-            return decoded === null ? null : { kind: "string", value: decoded };
-          }
-          try {
-            const decoded = tok.v === "decodeURIComponent"
-              ? decodeURIComponent(d.value)
-              : tok.v === "decodeURI"
-                ? decodeURI(d.value)
-                : unescapeJs(d.value);
-            return { kind: "string", value: decoded };
-          } catch {
-            return null;
-          }
+        return this.evalArgVariants((args) => {
+          const data = args[0];
+          if (data === undefined) return null;
+          return mapSetValues(data, (d) => {
+            if (d === null || d.kind !== "string") return null;
+            if (tok.v === "atob") {
+              const decoded = decodeBase64(d.value, false);
+              return decoded === null ? null : { kind: "string", value: decoded };
+            }
+            try {
+              const decoded = tok.v === "decodeURIComponent"
+                ? decodeURIComponent(d.value)
+                : tok.v === "decodeURI"
+                  ? decodeURI(d.value)
+                  : unescapeJs(d.value);
+              return { kind: "string", value: decoded };
+            } catch {
+              return null;
+            }
+          });
         });
       }
       return this.env.get(tok.v) ?? null;
