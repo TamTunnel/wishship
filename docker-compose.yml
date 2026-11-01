@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: wishship
+      POSTGRES_PASSWORD: wishship-dev
+      POSTGRES_DB: wishship
+    volumes:
+      - wishship-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wishship"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://wishship:wishship-dev@db:5432/wishship
+      PORT: "3000"
+      BASE_URL: ${BASE_URL:-http://localhost:3000}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY to 32 bytes hex}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      SCRIPT_BACKEND_COMMAND: ${SCRIPT_BACKEND_COMMAND:-}
+      OPERATOR_LOGINS: ${OPERATOR_LOGINS:-}
+    ports:
+      - "3000:3000"
+    volumes:
+      # Worktrees live in the container's tmp by default; mount a volume
+      # if you want to inspect them (they are deleted after each run).
+      - wishship-work:/tmp
+
+volumes:
+  wishship-data:
+  wishship-work:
