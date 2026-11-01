@@ -5,6 +5,8 @@ Each cycle, the top-voted wish goes to the maintainer for approval. An approved 
 implemented by a coding agent, verified by deterministic checks, and opened as a **draft PR**
 carrying the full verification report. The maintainer reviews and merges. The agent never merges.
 
+**Demo:** [https://tamtunnel.github.io/wishship/](https://tamtunnel.github.io/wishship/) — explainer page with a short video of a real end-to-end run ([watch the video](https://tamtunnel.github.io/wishship/#video)). Note: this page is an explainer, not a live service — WishShip is self-hostable (see Deployment notes).
+
 ## The problem, in plain language
 
 Open-source maintainers drown in feature requests. Issues pile up, voters have no say in what
