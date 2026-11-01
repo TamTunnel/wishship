@@ -267,6 +267,12 @@ so an in-flight run cannot open a PR after the operator pauses.
   (revokes the installation), global pause on agent runs (operator page). Re-linking a
   disconnected repo does **not** re-enable it — only an explicit maintainer reconnect
   does, and linking a repo requires the caller to be a maintainer of that repo.
+- **Verification gaps (stated, not hidden):** `docker compose up` was never
+  boot-verified in the development environment used for this build (no Docker
+  there), and the real GitHub App push path has only ever run against the
+  in-memory FakeGitHub client, never against a real repo. Verify both on a
+  machine with Docker and a real GitHub App installation before trusting a
+  production deployment.
 - **Secrets:** installation tokens are short-lived and never stored. The service clone's
   token-bearing remote is stripped immediately after cloning, and token URLs are scrubbed
   from git error output. Stored operator secrets are encrypted at rest (AES-256-GCM, key

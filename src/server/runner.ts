@@ -196,6 +196,15 @@ export async function approveWinnerAndCreateRun(
     await client.query("COMMIT");
     await audit(pool, actorId, "winner_approved", "wish", wish.id, null, { backend });
     await audit(pool, actorId, "run_created", "run", run.id, null, { backend });
+    // The retry path audits its churn override distinctly
+    // (run_retried_with_churn_override); the approve-time path gets
+    // its own event too, so both override routes are auditable.
+    if (allowChurn) {
+      await audit(pool, actorId, "run_approved_with_churn_override", "run", run.id, null, {
+        backend,
+        winnerId,
+      });
+    }
     return {
       winner: { ...winner, state: "approved" as const },
       wish: { ...wish, state: "approved" as const },

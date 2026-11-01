@@ -83,16 +83,126 @@ export function scanSecrets(text: string): string[] {
   return hits;
 }
 
-const OPERAND =
-  /([A-Za-z_$][\w$]*|"[^"\n]*"|'[^'\n]*')\s*\+\s*([A-Za-z_$][\w$]*|"[^"\n]*"|'[^'\n]*')/g;
+const OPERAND_SRC = String.raw`(?:[A-Za-z_$][\w$]*|"[^"\n]*"|'[^'\n]*')`;
+const CHAIN_RE = new RegExp(
+  `${OPERAND_SRC}(?:\\s*\\+\\s*${OPERAND_SRC})+`,
+  "g",
+);
+const OPERAND_ONLY_RE = new RegExp(OPERAND_SRC, "g");
+const JOIN_RE =
+  /([A-Za-z_$][\w$]*|\[[^\]\n]*\])\s*\.join\(\s*(?:"([^"]*)"|'([^']*)')?\s*\)/g;
+const LITERAL_ASSIGN_RE =
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["']([^"']*)["']/g;
+const ARRAY_ASSIGN_RE =
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\[([^\]\n]*)\]/g;
+const EXPR_ASSIGN_RE =
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+)/g;
+
+/** Unquote a string literal token, or return null for non-literals. */
+function literalValue(tok: string): string | null {
+  const lit = tok.match(/^["']([^"']*)["']$/);
+  return lit ? lit[1] : null;
+}
 
 function resolveOperand(
   tok: string,
   assigned: Map<string, string>,
 ): string | null {
-  const lit = tok.match(/^["']([^"']*)["']$/);
-  if (lit) return lit[1];
+  const lit = literalValue(tok);
+  if (lit !== null) return lit;
   return assigned.get(tok) ?? null;
+}
+
+/** Resolve a `.join()` receiver to its element tokens, if known. */
+function joinElements(
+  receiver: string,
+  arrays: Map<string, string[]>,
+): string[] | null {
+  const trimmed = receiver.trim();
+  if (trimmed.startsWith("[")) {
+    return [...trimmed.slice(1, -1).matchAll(OPERAND_ONLY_RE)].map((m) => m[0]);
+  }
+  return arrays.get(trimmed) ?? null;
+}
+
+/** Resolve one `.join()` call to its joined string, or null. */
+function resolveJoinCall(
+  receiver: string,
+  separator: string | undefined,
+  assigned: Map<string, string>,
+  arrays: Map<string, string[]>,
+): string | null {
+  const elements = joinElements(receiver, arrays);
+  if (elements === null) return null;
+  const resolved: string[] = [];
+  for (const el of elements) {
+    const v = resolveOperand(el, assigned);
+    if (v === null) return null;
+    resolved.push(v);
+  }
+  // Array.prototype.join with no argument uses ",".
+  return resolved.join(separator ?? ",");
+}
+
+/**
+ * Resolve a right-hand-side expression to a plain string, or null when
+ * it is not a reconstructable value: a literal, an assigned identifier,
+ * a full `+` chain (parens ignored), a `.join()` call, or a template
+ * literal whose ${...} parts all resolve.
+ */
+function resolveExpression(
+  expr: string,
+  assigned: Map<string, string>,
+  arrays: Map<string, string[]>,
+): string | null {
+  const e = expr.trim();
+  const lit = literalValue(e);
+  if (lit !== null) return lit;
+  if (/^[A-Za-z_$][\w$]*$/.test(e)) return assigned.get(e) ?? null;
+  const noParens = e.replace(/[()]/g, "");
+  const joinMatch = [...noParens.matchAll(JOIN_RE)];
+  if (joinMatch.length === 1) {
+    const before = noParens.slice(0, joinMatch[0].index).trim();
+    const after = noParens.slice(joinMatch[0].index + joinMatch[0][0].length).trim();
+    if (before === "" && after === "") {
+      return resolveJoinCall(
+        joinMatch[0][1],
+        joinMatch[0][2] ?? joinMatch[0][3],
+        assigned,
+        arrays,
+      );
+    }
+  }
+  const operands = [...noParens.matchAll(OPERAND_ONLY_RE)].map((m) => m[0]);
+  if (operands.length >= 2) {
+    // The whole expression must be operands joined by `+` (and
+    // whitespace) — anything else means this is not a plain chain.
+    const remainder = noParens
+      .replace(OPERAND_ONLY_RE, "")
+      .replace(/\+/g, "")
+      .trim();
+    if (remainder === "") {
+      const resolved: string[] = [];
+      for (const op of operands) {
+        const v = resolveOperand(op, assigned);
+        if (v === null) return null;
+        resolved.push(v);
+      }
+      return resolved.join("");
+    }
+  }
+  if (e.startsWith("`") && e.endsWith("`")) {
+    let resolved = e.slice(1, -1);
+    let ok = false;
+    for (const ref of e.matchAll(/\$\{([A-Za-z_$][\w$]*)\}/g)) {
+      const v = assigned.get(ref[1]);
+      if (v === undefined) return null;
+      resolved = resolved.replace(ref[0], v);
+      ok = true;
+    }
+    if (ok) return resolved;
+  }
+  return null;
 }
 
 /**
@@ -103,9 +213,14 @@ function resolveOperand(
  * is trivial. So, in addition to per-line scanning, this scans:
  * - the lines joined with newlines and with nothing (a token wrapped
  *   across a line break),
- * - `x + y` expressions with operands resolved through same-diff
- *   `const/let/var name = "literal"` assignments (and through quoted
- *   literals directly), and
+ * - full `+` chains of any length (`a + b + c`, parenthesized
+ *   groupings, chains spanning lines) with operands resolved through
+ *   same-diff assignments — including values propagated through
+ *   intermediate expression assignments (`const key = a + b;` then
+ *   `const full = key + c;`),
+ * - `.join()` reconstructions: literal arrays (`[a, b].join("")`)
+ *   and identifier arrays (`parts.join("")` where `parts` is assigned
+ *   an array literal in the diff), with any separator, and
  * - template literals whose ${...} parts all resolve through those
  *   assignments.
  * Deliberately NOT scanned: adjacent quoted literals with no join
@@ -127,33 +242,73 @@ export function scanAddedLines(lines: string[]): string[] {
   for (const line of lines) add(line);
   add(lines.join("\n"));
   add(lines.join(""));
+  // Collect same-diff assignments, then propagate resolved values
+  // through expression assignments to a fixpoint, so a chain built
+  // in two steps (key = a + b; full = key + c) still resolves.
   const assigned = new Map<string, string>();
+  const arrays = new Map<string, string[]>();
   for (const line of lines) {
-    for (const m of line.matchAll(
-      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["']([^"']*)["']/g,
-    )) {
-      assigned.set(m[1], m[2]);
+    for (const m of line.matchAll(LITERAL_ASSIGN_RE)) assigned.set(m[1], m[2]);
+    for (const m of line.matchAll(ARRAY_ASSIGN_RE)) {
+      arrays.set(m[1], [...m[2].matchAll(OPERAND_ONLY_RE)].map((x) => x[0]));
     }
   }
-  for (const line of lines) {
-    for (const m of line.matchAll(OPERAND)) {
-      const left = resolveOperand(m[1], assigned);
-      const right = resolveOperand(m[2], assigned);
-      if (left !== null && right !== null) add(left + right);
-    }
-    for (const tm of line.matchAll(/`([^`]*)`/g)) {
-      const body = tm[1];
-      let resolved = body;
-      let ok = true;
-      for (const ref of body.matchAll(/\$\{([A-Za-z_$][\w$]*)\}/g)) {
-        const v = assigned.get(ref[1]);
-        if (v === undefined) {
-          ok = false;
-          break;
+  for (let pass = 0; pass < 10; pass++) {
+    let changed = false;
+    for (const line of lines) {
+      for (const m of line.matchAll(EXPR_ASSIGN_RE)) {
+        if (assigned.has(m[1])) continue;
+        const v = resolveExpression(m[2], assigned, arrays);
+        if (v !== null) {
+          assigned.set(m[1], v);
+          changed = true;
         }
-        resolved = resolved.replace(ref[0], v);
       }
-      if (ok && resolved !== body) add(resolved);
+    }
+    if (!changed) break;
+  }
+  // Reconstruct: expand `.join()` calls to their joined value (and
+  // scan it directly), then resolve every `+` chain in the result.
+  // Paren-stripped copies catch `(a + b) + c` groupings. Units cover
+  // single lines, newline-joined text (multi-line chains), and
+  // nothing-joined text (line-wrapped chains).
+  const units = [...lines, lines.join("\n"), lines.join("")];
+  for (const unit of units) {
+    for (const text of [unit, unit.replace(/[()]/g, "")]) {
+      const expanded = text.replace(JOIN_RE, (whole, receiver, d, s) => {
+        const joined = resolveJoinCall(receiver, d ?? s, assigned, arrays);
+        if (joined === null) return whole;
+        add(joined);
+        return JSON.stringify(joined);
+      });
+      for (const m of expanded.matchAll(CHAIN_RE)) {
+        const operands = [...m[0].matchAll(OPERAND_ONLY_RE)].map((x) => x[0]);
+        const resolved: string[] = [];
+        let ok = true;
+        for (const op of operands) {
+          const v = resolveOperand(op, assigned);
+          if (v === null) {
+            ok = false;
+            break;
+          }
+          resolved.push(v);
+        }
+        if (ok) add(resolved.join(""));
+      }
+      for (const tm of expanded.matchAll(/`([^`]*)`/g)) {
+        const body = tm[1];
+        let resolved = body;
+        let ok = true;
+        for (const ref of body.matchAll(/\$\{([A-Za-z_$][\w$]*)\}/g)) {
+          const v = assigned.get(ref[1]);
+          if (v === undefined) {
+            ok = false;
+            break;
+          }
+          resolved = resolved.replace(ref[0], v);
+        }
+        if (ok && resolved !== body) add(resolved);
+      }
     }
   }
   return [...hits];
