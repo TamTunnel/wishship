@@ -49,14 +49,36 @@ vote → approve → build → verify → review → ship.
   and bare expressions in the added lines — not just known shapes — and scans those
   values against the secret patterns: `+` chains of any length, template literals,
   `.concat()`, `.join()` (literal or variable separator, default `,`), literal,
-  spread, and push-built arrays, `String.fromCharCode()`, and values propagated
-  through intermediate assignments. A token split across lines or rebuilt from quoted
-  fragments fails the scan. Mere adjacency without a join operator
-  is NOT flagged: concatenating neighboring literals fabricated tokens that do not exist
-  in the source (it once blocked a JSON env dump, where `"1"` + `"PATH"` + the PATH
-  value formed a 40-character slash run tripping the AWS-secret shape). Unresolvable
-  expressions (other function calls, member access, values from outside the diff) stay
-  unknown and are never flagged alone.
+  spread, and push-built arrays, `String.fromCharCode()` / `fromCodePoint()`, and
+  values propagated through intermediate assignments. Beyond that, the resolver
+  computes string methods on resolved values with real JS semantics (slice,
+  substring, replace/replaceAll, trim, case, split, charAt, pad), object member
+  bindings, numeric values and arithmetic (`charCodeAt` / `codePointAt` feeding
+  `fromCharCode`), decoders (`decodeURIComponent`, `decodeURI`, `unescape`,
+  `TextDecoder`, `atob`, `Buffer.from` base64/hex), `JSON.parse` (→ modeled
+  object), and `Array.from` / `of`. Diff-defined functions are evaluated with
+  arguments bound — single returns, straight-line assignments, `for...of` loops
+  with `+=` accumulation, `if`/`else` (unknown conditions union both branches'
+  returns), and function-valued `replace` callbacks. A token split across lines
+  or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
+  operator is NOT flagged: concatenating neighboring literals fabricated tokens
+  that do not exist in the source (it once blocked a JSON env dump, where `"1"`
+  + `"PATH"` + the PATH value formed a 40-character slash run tripping the
+  AWS-secret shape). Unresolvable expressions stay unknown and are never flagged
+  alone — EXCEPT the conservative fallback for diff-defined function calls: if
+  the call's raw string-literal arguments (or array-literal elements) concatenate
+  in order to a secret pattern, the scan flags it even when the body is
+  intractable. Honest code never passes fragments that concatenate to a secret
+  into a helper except to rebuild one, so this only fires on genuine
+  reconstructions. The residual boundary after round 6: recursion, closures over
+  mutated state, classes, `eval`, classic `for` loops, `while`, `switch`, and
+  `try` bodies (skipped, not interpreted) — a helper with such a body is still
+  caught when called with literal fragments (via the fallback), but NOT when
+  the fragments arrive via variables; multi-path object-method calls;
+  multi-path call results combined with further expressions at the call site
+  (each branch outcome is scanned, but not the combination); and values from
+  outside the diff (see the diff-only scope note below). These are stated
+  limits of a diff-only value resolver, not hidden gaps.
 - **Churn override (maintainer-only, audited).** When a run blocks ONLY on the churn-size
   heuristic — e.g. a legitimate 30-line helper with no relation to the wish — the
   maintainer can attest the unrelated files are legitimate, either up front
