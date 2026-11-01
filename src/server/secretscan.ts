@@ -174,6 +174,20 @@ export function scanSecrets(text: string): string[] {
  *   `String.fromCharCode(...pickCodes(flag))` collapsed to one set
  *   argument that the per-code distribution saw as an array and
  *   gave up on. Spread of a non-array stays a single argument.
+ * - `.apply()` / `.call()` (round 9): apply/call forms rewrite to
+ *   the equivalent direct call and are re-parsed with the same
+ *   environment, so every call form above evaluates identically in
+ *   apply/call form — `fn.apply(thisArg, argArray)` becomes
+ *   `fn(...argArray)`, `fn.call(thisArg, ...args)` becomes
+ *   `fn(...args)`, and `Reflect.apply(fn, thisArg, argArray)`
+ *   (recognized by its receiver tokens, only when `Reflect` is
+ *   unbound) becomes `fn(...argArray)`. An own apply/call property
+ *   on an object receiver is a plain method call, not
+ *   Function.prototype.apply, and falls through. `.push.apply()` /
+ *   `.push.call()` are side effects, not values: they append into
+ *   the thisArg array (exact JS semantics) in the statement walk
+ *   and in helper bodies, and in the Parser in sequential mode
+ *   only (the fixpoint pass is assignments-only).
  *
  * Deliberately NOT modeled (stays unknown, never flagged alone):
  * - recursion, closures over mutated state, classes, `eval`, and
@@ -1190,6 +1204,20 @@ class Parser {
         if (member?.t !== "ident") break;
         if (open?.t === "punct" && open.v === "(") {
           // Method call.
+          // Round 9: `.apply()` / `.call()` rewrite to the
+          // equivalent direct call (see tryApplyCall), so a
+          // variadic builtin, modeled builtin, or diff-defined
+          // function evaluates identically in apply/call form.
+          // An own apply/call property on an object receiver falls
+          // through to the plain method-call dispatch below.
+          if (member.v === "apply" || member.v === "call") {
+            const r = this.tryApplyCall(start, member.v, v);
+            if (r !== undefined) {
+              if (r === null) return null;
+              v = r;
+              continue;
+            }
+          }
           const recvTok = this.toks[start];
           if (
             this.pos - start === 1 &&
@@ -1794,6 +1822,146 @@ class Parser {
     return makeSet(outs);
   }
 
+  /**
+   * Evaluate `.apply()` / `.call()` (round 9). `pos` is at the `.`
+   * before the member name and `start` is the start of the callee
+   * chain; on return `pos` is past the closing paren (or left
+   * wherever parsing stopped on a malformed call — the caller
+   * abandons the chain with null in that case).
+   *
+   * Value calls rewrite to the equivalent direct call and are
+   * re-parsed with the same environment, so every call form the
+   * resolver already evaluates also evaluates in apply/call form:
+   * `fn.apply(thisArg, argArray)` becomes `fn(...argArray)` and
+   * `fn.call(thisArg, ...args)` becomes `fn(...args)` (the thisArg
+   * never contributes value material). `Reflect.apply(fn, thisArg,
+   * argArray)` is recognized by its receiver tokens, but only when
+   * `Reflect` is unbound in the environment, so a user-defined
+   * `Reflect` is never hijacked. Each rewrite strictly shortens
+   * the token stream (the `.apply(`/`.call(` wrapper and the
+   * thisArg are dropped), so nested apply/call forms terminate.
+   *
+   * A callee ending in `.push` is NOT rewritten: it is a side
+   * effect. `x.push.apply(y, elems)` / `x.push.call(y, ...elems)`
+   * append into the thisArg array (exact JS semantics — the
+   * receiver's base is irrelevant), in sequential mode only,
+   * mirroring the statement walk. A set-valued thisArg fans out
+   * per member array; a non-array thisArg is a runtime throw, so
+   * nothing is pushed. Returns the new length (or a set of
+   * lengths for a set target), or null when nothing was pushed.
+   *
+   * Returns undefined ONLY when the caller should fall through to
+   * the existing dispatch: an own apply/call property on an object
+   * receiver is a plain method call, not Function.prototype.apply.
+   * Any other failure returns null (fail-closed) with the call
+   * consumed.
+   */
+  private tryApplyCall(start: number, kind: "apply" | "call", recv: Value): Value | undefined {
+    const calleeToks = this.toks.slice(start, this.pos);
+    if (calleeToks.length === 0) return null;
+    if (recv !== null && recv.kind === "object") {
+      const own = recv.props.get(kind);
+      if (own !== undefined && own !== null && own.kind === "function") return undefined;
+    }
+    const last = calleeToks[calleeToks.length - 1];
+    const prev = calleeToks[calleeToks.length - 2];
+    const isPush =
+      last?.t === "ident" && last.v === "push" && prev?.t === "punct" && prev.v === "." &&
+      recv !== null && recv.kind === "array";
+    // Advance past `.apply(` / `.call(`.
+    this.pos += 3;
+    const close = matchBracket(this.toks, this.pos - 1);
+    if (close === -1) return null;
+    const groups = splitTopLevel(this.toks.slice(this.pos, close));
+    const after = close + 1;
+    if (isPush) {
+      this.pos = after;
+      // Sequential mode only: the fixpoint pass is assignments-only.
+      if (this.ctx.mode !== "sequential") return null;
+      const parsed = groups.map((g) => {
+        if (g.length > 0 && g[0]?.t === "punct" && g[0].v === "...") {
+          return {
+            value: new Parser(g.slice(1), this.env, this.ctx).parseExpr(),
+            spread: true,
+          };
+        }
+        return { value: new Parser(g, this.env, this.ctx).parseExpr(), spread: false };
+      });
+      let target: Value | null = null;
+      let elemVals: Value[] = [];
+      if (kind === "apply") {
+        if (parsed.length < 2) return null;
+        target = parsed[0].value;
+        const arr = parsed[1].value;
+        if (arr === null) return null;
+        if (arr.kind === "array") elemVals = [...arr.items];
+        else if (arr.kind === "set") elemVals = [arr];
+        else return null;
+      } else {
+        if (parsed.length < 1) return null;
+        target = parsed[0].value;
+        for (const a of parsed.slice(1)) {
+          if (a.spread && a.value !== null && a.value.kind === "array") {
+            elemVals.push(...a.value.items);
+          } else {
+            elemVals.push(a.value);
+          }
+        }
+      }
+      const targets: Value[] = [];
+      if (target !== null && target.kind === "array") targets.push(target);
+      else if (target !== null && target.kind === "set") {
+        for (const m of target.values) {
+          if (m !== null && m.kind === "array") targets.push(m);
+        }
+      }
+      if (targets.length === 0) return null;
+      for (const t of targets) {
+        if (t !== null && t.kind === "array") t.items.push(...elemVals);
+      }
+      const lens: Value[] = [];
+      for (const t of targets) {
+        if (t !== null && t.kind === "array") lens.push({ kind: "number", value: t.items.length });
+      }
+      return makeSet(lens);
+    }
+    // Rewrite path: value calls only.
+    const punct = (v: string): Tok => ({ t: "punct", v });
+    const isReflect =
+      calleeToks.length === 1 &&
+      calleeToks[0]?.t === "ident" &&
+      calleeToks[0].v === "Reflect" &&
+      recv === null;
+    let callToks: Tok[];
+    if (kind === "apply") {
+      if (isReflect) {
+        if (groups.length < 3) {
+          this.pos = after;
+          return null;
+        }
+        callToks = [...groups[0], punct("("), punct("..."), ...groups[2], punct(")")];
+      } else {
+        if (groups.length < 2) {
+          this.pos = after;
+          return null;
+        }
+        callToks = [...calleeToks, punct("("), punct("..."), ...groups[1], punct(")")];
+      }
+    } else {
+      const rest: Tok[] = [];
+      groups.slice(1).forEach((g, i) => {
+        if (i > 0) rest.push(punct(","));
+        rest.push(...g);
+      });
+      callToks = [...calleeToks, punct("("), ...rest, punct(")")];
+    }
+    const sub = new Parser(callToks, this.env, this.ctx);
+    const out = sub.parseExpr();
+    this.pos = after;
+    if (sub.pos !== sub.toks.length) return null;
+    return out;
+  }
+
   /** Parse an arrow-function body starting at `bodyStart`; null if unparseable. */
   private parseArrowBody(params: FuncParam[], bodyStart: number): FuncDef | null {
     const bodyTok = this.toks[bodyStart];
@@ -2198,6 +2366,14 @@ interface EvalCtx {
   depth: number;
   stack: Set<FuncDef>;
   steps: { count: number };
+  // Round 9: the statement-walk pass currently running. The Parser
+  // applies `.push.apply` / `.push.call` side effects only in
+  // sequential mode, mirroring the statement walk, which skips
+  // pushes in fixpoint mode (assignments-only). Unset for ad-hoc
+  // parsers, where push side effects are skipped (fail-closed for
+  // the value; statement-level pushes are still tracked by the
+  // sequential walk itself).
+  mode?: "sequential" | "fixpoint";
 }
 
 function defaultCtx(): EvalCtx {
@@ -2593,6 +2769,75 @@ function execSimple(slice: Tok[], env: Map<string, Value>, ctx: EvalCtx): void {
     }
     return;
   }
+  // Round 9: `.push.apply()` / `.push.call()` in helper bodies.
+  // The target is the thisArg array (exact JS semantics), as in
+  // the statement walk; unlike plain push above, this branch is
+  // unconditional, matching execSimple's existing push behavior.
+  const pushDot2 = slice[j + 3];
+  const pushApplyName = slice[j + 4];
+  const pushApplyOpen = slice[j + 5];
+  if (
+    after?.t === "punct" && after.v === "." &&
+    pushName?.t === "ident" && pushName.v === "push" &&
+    pushDot2?.t === "punct" && pushDot2.v === "." &&
+    pushApplyName?.t === "ident" && (pushApplyName.v === "apply" || pushApplyName.v === "call") &&
+    pushApplyOpen?.t === "punct" && pushApplyOpen.v === "("
+  ) {
+    const close = matchBracket(slice, j + 5);
+    if (close === -1) return;
+    const groups = splitTopLevel(slice.slice(j + 6, close));
+    const parseGroup = (g: Tok[]): { value: Value; spread: boolean } => {
+      if (g.length > 0 && g[0]?.t === "punct" && g[0].v === "...") {
+        return {
+          value: new Parser(g.slice(1), env, ctx).parseExpr(),
+          spread: true,
+        };
+      }
+      return { value: new Parser(g, env, ctx).parseExpr(), spread: false };
+    };
+    const parsed = groups.map(parseGroup);
+    let target: Value | null = null;
+    let elemVals: Value[] = [];
+    if (pushApplyName.v === "apply") {
+      if (parsed.length >= 2) {
+        target = parsed[0].value;
+        const arr = parsed[1].value;
+        if (arr !== null && arr.kind === "array") elemVals = [...arr.items];
+        else if (arr !== null && arr.kind === "set") elemVals = [arr];
+      }
+    } else {
+      if (parsed.length >= 1) {
+        target = parsed[0].value;
+        for (const a of parsed.slice(1)) {
+          if (a.spread && a.value !== null && a.value.kind === "array") {
+            elemVals.push(...a.value.items);
+          } else {
+            elemVals.push(a.value);
+          }
+        }
+      }
+    }
+    const targets: Value[] = [];
+    if (target !== null && target.kind === "array") targets.push(target);
+    else if (target !== null && target.kind === "set") {
+      for (const m of target.values) {
+        if (m !== null && m.kind === "array") targets.push(m);
+      }
+    }
+    for (const t of targets) {
+      if (t !== null && t.kind === "array") t.items.push(...elemVals);
+    }
+    if (targets.length === 0 && elemVals.length > 0 && groups.length > 0) {
+      const thisArgGroup = groups[0];
+      if (
+        thisArgGroup !== undefined && thisArgGroup.length === 1 &&
+        thisArgGroup[0]?.t === "ident" && !env.has(thisArgGroup[0].v)
+      ) {
+        env.set(thisArgGroup[0].v, { kind: "array", items: elemVals });
+      }
+    }
+    return;
+  }
   const keys: string[] = [nameTok.v];
   let k = j + 1;
   let ok = true;
@@ -2884,6 +3129,9 @@ function walkStatements(
   mode: "sequential" | "fixpoint",
   ctx: EvalCtx = defaultCtx(),
 ): boolean {
+  // Round 9: record the pass so Parser-side `.push.apply` /
+  // `.push.call` side effects apply in sequential mode only.
+  ctx.mode = mode;
   let changed = false;
   const p = new Parser(toks, env, ctx);
   const atStatementStart = (idx: number): boolean => {
@@ -2992,6 +3240,73 @@ function walkStatements(
         env.set(nameTok.v, { kind: "array", items: args });
       }
       // Push on a non-array would throw at runtime; ignore.
+      const semi = toks[p.pos];
+      if (semi?.t === "punct" && semi.v === ";") p.pos++;
+      continue;
+    }
+    // Round 9: `.push.apply()` / `.push.call()` statements. The
+    // target is the thisArg array (exact JS semantics —
+    // `x.push.apply(y, e)` pushes into y, not x), not the
+    // statement's own name. Sequential mode only, like plain push.
+    const pushDot2 = toks[j + 3];
+    const pushApplyName = toks[j + 4];
+    const pushApplyOpen = toks[j + 5];
+    if (
+      mode === "sequential" &&
+      nameTok?.t === "ident" &&
+      dot?.t === "punct" && dot.v === "." &&
+      pushName?.t === "ident" && pushName.v === "push" &&
+      pushDot2?.t === "punct" && pushDot2.v === "." &&
+      pushApplyName?.t === "ident" && (pushApplyName.v === "apply" || pushApplyName.v === "call") &&
+      pushApplyOpen?.t === "punct" && pushApplyOpen.v === "("
+    ) {
+      p.pos = j + 6;
+      const raw = p.parseArgsRaw();
+      let target: Value | null = null;
+      let elemVals: Value[] = [];
+      if (pushApplyName.v === "apply") {
+        if (raw.length >= 2) {
+          target = raw[0].value;
+          const arr = raw[1].value;
+          if (arr !== null && arr.kind === "array") elemVals = [...arr.items];
+          else if (arr !== null && arr.kind === "set") elemVals = [arr];
+        }
+      } else {
+        if (raw.length >= 1) {
+          target = raw[0].value;
+          for (const a of raw.slice(1)) {
+            if (a.spread && a.value !== null && a.value.kind === "array") {
+              elemVals.push(...a.value.items);
+            } else {
+              elemVals.push(a.value);
+            }
+          }
+        }
+      }
+      const targets: Value[] = [];
+      if (target !== null && target.kind === "array") targets.push(target);
+      else if (target !== null && target.kind === "set") {
+        for (const m of target.values) {
+          if (m !== null && m.kind === "array") targets.push(m);
+        }
+      }
+      for (const t of targets) {
+        if (t !== null && t.kind === "array") t.items.push(...elemVals);
+      }
+      if (targets.length === 0 && elemVals.length > 0) {
+        // Push into an array declared outside the diff, named by a
+        // bare-ident thisArg: track the pushed elements alone
+        // (mirrors the plain-push rule above).
+        const thisArgTok = toks[j + 6];
+        const afterThisArg = toks[j + 7];
+        if (
+          thisArgTok?.t === "ident" &&
+          afterThisArg?.t === "punct" && afterThisArg.v === "," &&
+          !env.has(thisArgTok.v)
+        ) {
+          env.set(thisArgTok.v, { kind: "array", items: elemVals });
+        }
+      }
       const semi = toks[p.pos];
       if (semi?.t === "punct" && semi.v === ";") p.pos++;
       continue;

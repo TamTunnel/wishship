@@ -68,7 +68,13 @@ vote → approve → build → verify → review → ship.
   per argument-list variant, so a spread of a branchy (set-valued) array
   into a variadic builtin like `String.fromCharCode()` expands to the
   individual codes per branch instead of collapsing to one unknown
-  argument. A token split across lines
+  argument. `.apply()` / `.call()` forms rewrite to the equivalent direct
+  call (`fn.apply(thisArg, argArray)` → `fn(...argArray)`,
+  `fn.call(thisArg, ...args)` → `fn(...args)`,
+  `Reflect.apply(fn, thisArg, argArray)` → `fn(...argArray)`), so a
+  variadic builtin, modeled builtin, or diff-defined function evaluates
+  identically in apply/call form; `.push.apply()` / `.push.call()` append
+  into the thisArg array, as JS specifies. A token split across lines
   or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
   operator is NOT flagged: concatenating neighboring literals fabricated tokens
   that do not exist in the source (it once blocked a JSON env dump, where `"1"`
