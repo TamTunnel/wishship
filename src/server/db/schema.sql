@@ -33,10 +33,18 @@ CREATE TABLE IF NOT EXISTS wishes (
     CHECK (state IN ('open','proposed','approved','implementing','pr_open','shipped','rejected','hidden','needs_input')),
   injection_flag BOOLEAN NOT NULL DEFAULT false,
   injection_patterns TEXT[] NOT NULL DEFAULT '{}',
+  -- Secret-shaped material in the wish body, flagged at submission (not
+  -- blocking: flagging, not censorship). The PR body withholds flagged
+  -- bodies instead of quoting them verbatim.
+  secret_flag BOOLEAN NOT NULL DEFAULT false,
+  secret_patterns TEXT[] NOT NULL DEFAULT '{}',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS wishes_repo_state_idx ON wishes (repo_id, state);
+-- Added after v1: backfill for databases created before these columns.
+ALTER TABLE wishes ADD COLUMN IF NOT EXISTS secret_flag BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE wishes ADD COLUMN IF NOT EXISTS secret_patterns TEXT[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS wishes_title_body_idx ON wishes USING gin (to_tsvector('english', title || ' ' || body));
 
 CREATE TABLE IF NOT EXISTS votes (
@@ -99,6 +107,18 @@ CREATE TABLE IF NOT EXISTS verification_reports (
   checks JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- One winner per (cycle, wish): close-and-propose and maintainer-pick
+-- race safely against this instead of relying on a state pre-check.
+-- (Placed after the tables: a fresh-DB migrate aborts if an index
+-- references a table defined later in this file.)
+CREATE UNIQUE INDEX IF NOT EXISTS cycle_winners_cycle_wish_idx
+  ON cycle_winners (cycle_id, wish_id);
+-- One active run per winner: the backstop behind createRunForWinner's
+-- FOR UPDATE serialization. Terminal states (pr_opened/failed/blocked)
+-- do not count, so retries and recovery runs are still possible.
+CREATE UNIQUE INDEX IF NOT EXISTS runs_active_winner_idx
+  ON runs (winner_id) WHERE state IN ('queued','running','verifying');
 
 CREATE TABLE IF NOT EXISTS prs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

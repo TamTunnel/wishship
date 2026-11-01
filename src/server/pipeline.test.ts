@@ -50,8 +50,11 @@ describe("pipeline gates (probes 12, 13, 16, 18) and the happy path", () => {
       createRunForWinner(t.pool, pending.id, "script", false, String(maintainer.id)),
       /not been approved/,
     );
-    // Approved: succeeds and queues a job.
-    const pending2 = await store.createWinner(t.pool, cycle!.id, wish.id);
+    // Approved: succeeds and queues a job. (A second winner for the
+    // same wish in the same cycle is refused by the unique index, so
+    // the approved case uses a second wish.)
+    const wish2 = await store.createWish(t.pool, repo.id, maintainer.id, "Dark mode 2", "body", null, false, []);
+    const pending2 = await store.createWinner(t.pool, cycle!.id, wish2.id);
     await store.decideWinner(t.pool, pending2.id, "approved", maintainer.id, null);
     const run = await createRunForWinner(t.pool, pending2.id, "script", false, String(maintainer.id));
     assert.equal(run.state, "queued");

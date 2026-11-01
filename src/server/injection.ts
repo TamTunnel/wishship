@@ -39,6 +39,35 @@ export const INJECTION_PATTERNS: InjectionPattern[] = [
     name: "override-role",
     regex: /act\s+as\s+(a\s+)?(system|developer|admin|root)\b/i,
   },
+  // --- added in the fix round: the old list missed whole families ---
+  {
+    name: "forget-above",
+    regex: /forget\s+(everything|all)\s+(above|before|that came before)/i,
+  },
+  {
+    name: "pretend-roleplay",
+    regex: /pretend\s+(to\s+be|you\s+are)|roleplay\s+as\b/i,
+  },
+  { name: "developer-mode", regex: /developer\s+mode\b/i },
+  {
+    name: "do-not-follow",
+    regex: /do\s+not\s+follow\s+(the\s+)?(previous|above|system|earlier)?\s*instructions/i,
+  },
+  {
+    name: "include-api-key",
+    regex: /include\s+(the\s+)?(api[-_ ]?key|password|token|secret|credentials?)\b/i,
+  },
+  {
+    name: "base64-decode",
+    regex: /base64\s+(-d|--decode)|Buffer\.from\([^)]*,\s*['"]base64['"]\)|atob\s*\(/i,
+  },
+  {
+    name: "ignore-instructions-nonenglish",
+    // A small set of common translations, not a multilingual guarantee:
+    // coverage is English-first (see README). Spanish, French, German,
+    // Portuguese for "ignore the previous instructions".
+    regex: /ignora\s+las\s+instrucciones\s+anteriores|ignore\s+les\s+instructions\s+précédentes|ignoriere\s+die\s+vorherigen\s+Anweisungen|ignore\s+as\s+instruções\s+anteriores/i,
+  },
 ];
 
 export function scanInjection(text: string): string[] {

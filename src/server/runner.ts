@@ -12,6 +12,7 @@ import * as store from "./store";
 import type { Repo, Run } from "./store";
 import { audit } from "./store";
 import {
+  addedLinesPerFile,
   collectBaselineHosts,
   discoverCommands,
   verifyDiff,
@@ -91,7 +92,16 @@ export async function createRunForWinner(
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const winner = await store.getWinner(client, winnerId);
+    // Row lock: concurrent creates for the same winner serialize here
+    // instead of racing the active-run check below. The partial unique
+    // index on active runs is the backstop if the lock is ever bypassed.
+    const winnerRows = await client.query(
+      `SELECT * FROM cycle_winners WHERE id = $1 FOR UPDATE`,
+      [winnerId],
+    );
+    const winner = winnerRows.rows[0] as
+      | { id: string; cycle_id: string; state: string }
+      | undefined;
     if (!winner) throw new RunFailure("winner not found");
     if (winner.state !== "approved") {
       throw new RunFailure("winner has not been approved by a maintainer");
@@ -128,6 +138,97 @@ export async function createRunForWinner(
 }
 
 /**
+ * Atomic approve: decide + wish-state + run creation in ONE
+ * transaction. The old route did decide, then wish-state, then run
+ * creation as separate steps — run creation failing after decide left
+ * the winner `approved` with no run and no re-approve path. Here a
+ * failure rolls everything back, so the winner stays pending_approval
+ * and the maintainer can retry.
+ */
+export async function approveWinnerAndCreateRun(
+  pool: import("pg").Pool,
+  winnerId: string,
+  backend: string,
+  allowDependencies: boolean,
+  actorId: string,
+): Promise<{ winner: store.CycleWinner; wish: store.Wish; run: Run }> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const winnerRows = await client.query(
+      `SELECT * FROM cycle_winners WHERE id = $1 FOR UPDATE`,
+      [winnerId],
+    );
+    const winner = winnerRows.rows[0] as store.CycleWinner | undefined;
+    if (!winner) throw new RunFailure("winner not found");
+    if (winner.state !== "pending_approval") {
+      throw new RunFailure(`winner is ${winner.state}`);
+    }
+    const decided = await store.decideWinner(
+      client,
+      winnerId,
+      "approved",
+      Number(actorId),
+      null,
+    );
+    if (!decided) throw new RunFailure("winner is no longer pending approval");
+    const wish = await store.getWish(client, winner.wish_id);
+    if (!wish) throw new RunFailure("wish not found");
+    await store.setWishState(client, wish.id, "approved");
+    const active = await client.query(
+      `SELECT COUNT(*)::text AS n FROM runs
+       WHERE winner_id = $1 AND state IN ('queued','running','verifying')`,
+      [winnerId],
+    );
+    if (Number(active.rows[0].n) > 0) {
+      throw new RunFailure("winner already has an active run");
+    }
+    const run = await store.createRun(client, winnerId, backend, allowDependencies);
+    const cycle = await client.query(
+      `SELECT repo_id FROM cycles WHERE id = $1`,
+      [winner.cycle_id],
+    );
+    await store.createJob(client, run.id, cycle.rows[0].repo_id as string);
+    await client.query("COMMIT");
+    await audit(pool, actorId, "winner_approved", "wish", wish.id, null, { backend });
+    await audit(pool, actorId, "run_created", "run", run.id, null, { backend });
+    return {
+      winner: { ...winner, state: "approved" as const },
+      wish: { ...wish, state: "approved" as const },
+      run,
+    };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Re-validate immediately before PR opening: the run must still be
+ * `verifying` and its job still `claimed`. Crash recovery can finish a
+ * job and mint a retry while the original worker is still in flight;
+ * without this check the original worker would open a second PR for
+ * the same winner (duplicate spend, duplicate PRs). On mismatch the
+ * caller must NOT touch the job or run further — recovery owns them.
+ */
+export async function assertRunStillClaimed(
+  pool: import("pg").Pool,
+  jobId: string,
+  runId: string,
+): Promise<void> {
+  const run = await store.getRun(pool, runId);
+  const job = await store.getJob(pool, jobId);
+  if (!run || run.state !== "verifying") {
+    throw new RunFailure("run is no longer verifying (recovered elsewhere?)");
+  }
+  if (!job || job.status !== "claimed") {
+    throw new RunFailure("job is no longer claimed (recovered elsewhere?)");
+  }
+}
+
+/**
  * Open a PR for a run. THE gate for probe 12: the report is re-read
  * from the database and the tier must be VERIFIED or PARTIAL for THIS
  * run id. A BLOCKED report, a missing report, or a report for another
@@ -141,6 +242,12 @@ export async function openPrForRun(
   defaultBranch: string,
 ): Promise<{ number: number; url: string; branch: string }> {
   const { pool, github } = deps;
+  // Global pause is a claim-gate only in the worker loop; in-flight
+  // runs must ALSO stop before opening PRs, or pausing mid-run does
+  // nothing about the PR it was meant to prevent.
+  if (deps.isGloballyPaused()) {
+    throw new RunFailure("global pause is active; refusing to open a PR");
+  }
   const report = await store.getReportByRun(pool, run.id);
   if (!report) throw new RunFailure("no verification report for this run");
   if (report.tier !== "VERIFIED" && report.tier !== "PARTIAL") {
@@ -176,6 +283,7 @@ export async function openPrForRun(
     durationMs: run.duration_ms,
     costUsd: run.cost_usd,
     runId: run.id,
+    filesChanged: [...addedLinesPerFile(patch).keys()],
   });
   const pr = await github.openPr(
     repo.installation_id,
@@ -249,19 +357,43 @@ export class Worker {
   }
 
   private async recoverStaleClaims(): Promise<void> {
-    const { pool } = this.deps;
+    const { pool, config } = this.deps;
+    // The stale threshold tracks the operator-configured run timeout:
+    // the old hardcoded 30 minutes was SHORTER than a legitimate long
+    // run, so recovery fired mid-flight and duplicated runs, spend,
+    // and PRs. Floor at 30 minutes, plus a 10-minute margin over the
+    // configured timeout.
+    const staleMs = Math.max(30 * 60 * 1000, config.runTimeoutMs + 10 * 60 * 1000);
+    const cutoff = new Date(Date.now() - staleMs);
     const rows = await pool.query(
-      `SELECT j.id AS job_id, j.run_id, j.repo_id, j.attempts FROM jobs j
+      `SELECT j.id AS job_id, j.run_id, j.repo_id, j.attempts, r.state AS run_state FROM jobs j
        JOIN runs r ON r.id = j.run_id
-       WHERE j.status = 'claimed' AND j.claimed_at < now() - interval '30 minutes'
-         AND r.state IN ('running','verifying')`,
+       WHERE j.status = 'claimed' AND j.claimed_at < $1`,
+      [cutoff],
     );
     for (const row of rows.rows as {
       job_id: string;
       run_id: string;
       repo_id: string;
       attempts: number;
+      run_state: string;
     }[]) {
+      // Crash between claim and setRunState(running): the run never
+      // started, so just re-queue the job. No new run, no failure.
+      if (row.run_state === "queued") {
+        await pool.query(
+          `UPDATE jobs SET status = 'queued', claimed_at = NULL, updated_at = now() WHERE id = $1`,
+          [row.job_id],
+        );
+        await audit(pool, "system", "run_requeued_after_crash", "run", row.run_id, null, {
+          jobId: row.job_id,
+        });
+        continue;
+      }
+      if (row.run_state !== "running" && row.run_state !== "verifying") {
+        // Terminal already (or pr_opened): leave it alone.
+        continue;
+      }
       if (row.attempts > 2) {
         await store.setRunState(pool, row.run_id, "failed", {
           failure_reason: "worker lost (stale claim, attempts exhausted)",
@@ -270,8 +402,10 @@ export class Worker {
         continue;
       }
       // Crash recovery, bounded by attempts: the old run is dead, a
-      // fresh run takes its place. This is not a silent retry loop —
-      // attempts are capped and every recovery is audited.
+      // fresh run takes its place. The retry job INHERITS the dead
+      // job's attempt count, so the attempts > 2 guard above bounds
+      // the whole chain instead of resetting on every hop (the old
+      // code minted attempts-0 jobs forever).
       await store.setRunState(pool, row.run_id, "failed", {
         failure_reason: "worker lost (stale claim recovered)",
       });
@@ -285,7 +419,7 @@ export class Worker {
         oldRun.allow_dependencies,
         oldRun.id,
       );
-      await store.createJob(pool, retry.id, row.repo_id);
+      await store.createJob(pool, retry.id, row.repo_id, row.attempts);
       await audit(pool, "system", "run_recovered_after_crash", "run", retry.id, null, {
         previousRunId: oldRun.id,
       });
@@ -321,6 +455,13 @@ export class Worker {
     let worktreeDir: string | null = null;
     let verifyDir: string | null = null;
     let source: Awaited<ReturnType<WorkerDeps["resolveRepo"]>> | null = null;
+    // Cost is tracked so the failure path records it too: the old catch
+    // dropped cost entirely, undercounting monthly spend.
+    let knownCostUsd: number | null = null;
+    // Fresh agent HOME per run: the old shared AGENT_HOME let one run's
+    // agent plant CLI config/plugins/hooks that the next run's backend
+    // CLI would load. Created here, deleted in the finally below.
+    let agentHome: string | null = null;
     try {
       if (repo.paused || repo.disconnected) {
         throw new RunFailure("repo is paused or disconnected");
@@ -391,10 +532,16 @@ export class Worker {
 
       const before = await snapshotTempArea(config.worktreeRoot, worktree.dir);
       const backend: AgentBackend = createBackend(run.backend, this.deps.backends);
+      const { mkdtemp } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      agentHome = await mkdtemp(join(tmpdir(), "wishship-agent-"));
+      const agentEnv = { ...buildAgentEnv(config), HOME: agentHome };
       const result = await backend.run(specWithFeedback, worktree.dir, {
         timeoutMs: config.runTimeoutMs,
-        env: buildAgentEnv(config),
+        env: agentEnv,
       });
+      knownCostUsd = result.costUsd;
       const durationMs = Date.now() - startedAt;
 
       if (result.status === "timeout") {
@@ -458,6 +605,9 @@ export class Worker {
         backend,
         baselineHosts,
         outsideWrites,
+        // Pre-agent commands from the runner's base-commit discovery.
+        // verifyDiff must never re-discover from the patched tree.
+        commands,
       });
       const report = await store.createReport(pool, runId, verified.tier, verified.checks);
 
@@ -465,14 +615,14 @@ export class Worker {
         if (run.retry_of === null) {
           // Exactly one retry, with verifier feedback. After that the
           // run is dead — no silent retry loops, no runaway spend.
-          const retry = await store.createRun(
-            pool,
-            run.winner_id,
-            run.backend,
-            run.allow_dependencies,
-            run.id,
-          );
-          await store.createJob(pool, retry.id, repoId);
+          // NOTE: the wish deliberately stays `implementing` while the
+          // retry is queued (there is no `retrying` state in v1); the
+          // retry run re-asserts `implementing` when it starts, and
+          // the run record + audit show the retry chain.
+          // ORDER MATTERS: the original run must leave the active set
+          // (queued/running/verifying) BEFORE the retry is inserted,
+          // or the partial unique index on active runs rejects the
+          // retry with a duplicate-key error.
           await store.setRunState(pool, runId, "blocked", {
             duration_ms: durationMs,
             cost_usd: result.costUsd === null ? undefined : String(result.costUsd),
@@ -481,6 +631,14 @@ export class Worker {
               .map((c) => c.name)
               .join(", ")}`,
           });
+          const retry = await store.createRun(
+            pool,
+            run.winner_id,
+            run.backend,
+            run.allow_dependencies,
+            run.id,
+          );
+          await store.createJob(pool, retry.id, repoId);
           await audit(pool, "system", "run_blocked_retry_queued", "run", runId, null, {
             retryRunId: retry.id,
             tier: verified.tier,
@@ -515,6 +673,19 @@ export class Worker {
         duration_ms: durationMs,
         cost_usd: result.costUsd === null ? undefined : String(result.costUsd),
       });
+      // Re-validate immediately before PR opening: recovery may have
+      // finished this job and minted a retry while this worker was in
+      // flight. On mismatch, return WITHOUT touching job/run — recovery
+      // owns them now (the outer catch must not run: it would flip the
+      // recovered job's status and fail the recovered run's record).
+      // Only the assertion's own refusal returns early; a DB error
+      // still propagates to the failure path.
+      try {
+        await assertRunStillClaimed(pool, jobId, runId);
+      } catch (err) {
+        if (err instanceof RunFailure) return;
+        throw err;
+      }
       const pr = await openPrForRun(
         this.deps,
         { ...runFresh, duration_ms: durationMs, cost_usd: result.costUsd === null ? null : String(result.costUsd) },
@@ -541,6 +712,7 @@ export class Worker {
       await store
         .setRunState(pool, runId, "failed", {
           duration_ms: durationMs,
+          cost_usd: knownCostUsd === null ? undefined : String(knownCostUsd),
           failure_reason: message.slice(0, 1000),
         })
         .catch(() => undefined);
@@ -559,6 +731,10 @@ export class Worker {
       if (worktreeDir) await deleteWorktree(worktreeDir).catch(() => undefined);
       if (verifyDir) await deleteWorktree(verifyDir).catch(() => undefined);
       if (source) await source.cleanup().catch(() => undefined);
+      if (agentHome) {
+        const { rm } = await import("node:fs/promises");
+        await rm(agentHome, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 }

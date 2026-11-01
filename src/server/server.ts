@@ -24,6 +24,31 @@ const CONTENT_TYPES: Record<string, string> = {
 };
 
 /**
+ * Strip credential-bearing state from a service-side clone, immediately
+ * after cloning and before any agent worktree is derived from it. The
+ * installation token arrives in the clone URL, so without this the URL
+ * persists in `.git/config` (and `.git/FETCH_HEAD`) for the whole run,
+ * readable by the same-UID agent process. After stripping, the clone
+ * has no remote at all; agent worktrees clone from this local path and
+ * strip their own remote too.
+ *
+ * Residual, stated plainly (not hidden): a same-UID agent can still
+ * read the service process's environment via /proc/<pid>/environ. True
+ * separation needs a different UID or container per run (v1.1).
+ */
+export async function stripCloneCredentials(dir: string): Promise<void> {
+  try {
+    await execFileAsync("git", ["remote", "remove", "origin"], {
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? "" },
+    });
+  } catch {
+    // No remote to remove; nothing to strip.
+  }
+  await rm(join(dir, ".git", "FETCH_HEAD"), { force: true });
+}
+
+/**
  * Production repo resolution: the SERVICE clones with a short-lived
  * installation token into a temp dir, and agent worktrees clone from
  * that local path. The token never appears in an agent worktree, in
@@ -39,6 +64,9 @@ export function productionResolveRepo(github: GitHubClient): ResolveRepoSource {
         env: { PATH: process.env.PATH ?? "" },
         maxBuffer: 10 * 1024 * 1024,
       });
+      // Strip BEFORE returning: the source clone lives for the whole
+      // run, and the agent process shares the service's UID.
+      await stripCloneCredentials(dir);
     } catch (err) {
       await rm(dir, { recursive: true, force: true });
       const message = (err as Error).message.replace(
@@ -75,8 +103,13 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   });
 
   // Static frontend (Vite build output). API routes take precedence.
+  // Unknown /api/* paths are 404, not the SPA shell: returning
+  // index.html with 200 for an API typo hides client bugs.
   app.get("/*", async (req, reply) => {
     const urlPath = (req.url.split("?")[0] ?? "/").replace(/^\/+/, "");
+    if (urlPath.startsWith("api/")) {
+      return reply.code(404).send({ error: "not found" });
+    }
     const clientDist = resolve(process.cwd(), "client", "dist");
     const tryFile = async (name: string): Promise<Buffer | null> => {
       const path = resolve(clientDist, name);

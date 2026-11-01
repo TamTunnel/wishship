@@ -84,6 +84,8 @@ export interface Wish {
   state: WishState;
   injection_flag: boolean;
   injection_patterns: string[];
+  secret_flag: boolean;
+  secret_patterns: string[];
   created_at: Date;
   updated_at: Date;
 }
@@ -218,11 +220,14 @@ export async function createRepo(
   installationId: number,
   fullName: string,
 ): Promise<Repo> {
+  // NOTE: the upsert deliberately does NOT clear `disconnected`. A
+  // deliberately disconnected repo used to silently re-enable on
+  // re-link; re-enabling now requires an explicit maintainer reconnect.
   const row = await queryOne<RepoRow>(
     pool,
     `INSERT INTO repos (installation_id, full_name) VALUES ($1, $2)
      ON CONFLICT (full_name) DO UPDATE SET installation_id = EXCLUDED.installation_id,
-       disconnected = false, updated_at = now()
+       updated_at = now()
      RETURNING *`,
     [installationId, fullName],
   );
@@ -301,13 +306,15 @@ export async function createWish(
   linkedIssueUrl: string | null,
   injectionFlag: boolean,
   injectionPatterns: string[],
+  secretFlag = false,
+  secretPatterns: string[] = [],
 ): Promise<Wish> {
   const row = await queryOne<Wish>(
     pool,
     `INSERT INTO wishes (repo_id, author_id, title, body, linked_issue_url,
-       injection_flag, injection_patterns)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-    [repoId, authorId, title, body, linkedIssueUrl, injectionFlag, injectionPatterns],
+       injection_flag, injection_patterns, secret_flag, secret_patterns)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [repoId, authorId, title, body, linkedIssueUrl, injectionFlag, injectionPatterns, secretFlag, secretPatterns],
   );
   if (!row) throw new Error("createWish failed");
   return row;
@@ -480,17 +487,24 @@ export async function openCycle(pool: Db, repoId: string): Promise<Cycle> {
   return row;
 }
 
+export async function getCycle(pool: Db, id: string): Promise<Cycle | null> {
+  return queryOne<Cycle>(pool, `SELECT * FROM cycles WHERE id = $1`, [id]);
+}
+
 export async function closeCycle(
   pool: Db,
   id: string,
   anomalySuspected: boolean,
   anomalyDetails: unknown,
-): Promise<void> {
-  await pool.query(
+): Promise<boolean> {
+  // Conditional close: a concurrent close of the same cycle must fail
+  // instead of silently double-closing. Callers check the return value.
+  const res = await pool.query(
     `UPDATE cycles SET closed_at = now(), anomaly_suspected = $2,
-     anomaly_details = $3::jsonb WHERE id = $1`,
+     anomaly_details = $3::jsonb WHERE id = $1 AND closed_at IS NULL`,
     [id, anomalySuspected, anomalyDetails ? JSON.stringify(anomalyDetails) : null],
   );
+  return (res.rowCount ?? 0) > 0;
 }
 
 export async function createWinner(
@@ -533,12 +547,16 @@ export async function decideWinner(
   state: "approved" | "rejected",
   approverId: number,
   reason: string | null,
-): Promise<void> {
-  await pool.query(
+): Promise<boolean> {
+  // Returns whether the transition happened: the conditional update is
+  // the race guard, and callers MUST check it instead of assuming the
+  // pre-check state still holds.
+  const res = await pool.query(
     `UPDATE cycle_winners SET state = $2, approver_id = $3, reason = $4,
      decided_at = now() WHERE id = $1 AND state = 'pending_approval'`,
     [id, state, approverId, reason],
   );
+  return (res.rowCount ?? 0) > 0;
 }
 
 // ---------- runs / reports / prs ----------
@@ -712,11 +730,10 @@ export async function listAudit(
   limit = 200,
 ): Promise<Record<string, unknown>[]> {
   // Audit rows carry entity ids; repo-scoped views filter on wish/run ids
-  // belonging to the repo. The board shows the repo's own history.
-  // Audit rows carry entity ids as text; wish/run ids are UUIDs, so the
-  // subqueries cast to text (a bare text = uuid comparison errors). The
-  // repo id is passed twice: $1 for the UUID columns, $3 for the text
-  // comparison, because one parameter cannot carry two inferred types.
+  // belonging to the repo, plus cycle entities (cycle_closed events used
+  // to be invisible in the repo audit view). The repo id is passed
+  // twice: $1 for the UUID columns, $3 for the text comparison, because
+  // one parameter cannot carry two inferred types.
   return queryAll<Record<string, unknown>>(
     pool,
     `SELECT a.* FROM audit_events a
@@ -724,6 +741,8 @@ export async function listAudit(
         OR a.entity_id IN (SELECT r.id::text FROM runs r
            JOIN cycle_winners cw ON cw.id = r.winner_id
            JOIN cycles c ON c.id = cw.cycle_id WHERE c.repo_id = $1)
+        OR (a.entity_type = 'cycle' AND a.entity_id IN
+            (SELECT id::text FROM cycles WHERE repo_id = $1))
         OR a.entity_id = $3
      ORDER BY a.id DESC LIMIT $2`,
     [repoId, limit, repoId],
@@ -732,53 +751,92 @@ export async function listAudit(
 
 // ---------- jobs ----------
 
+export async function getJob(pool: Db, id: string): Promise<Job | null> {
+  return queryOne<Job>(pool, `SELECT * FROM jobs WHERE id = $1`, [id]);
+}
+
 export async function createJob(
   pool: Db,
   runId: string,
   repoId: string,
+  attempts = 0,
 ): Promise<Job> {
+  // `attempts` is carried across crash-recovery chains (the recovery
+  // job inherits the dead job's attempt count) so the attempts guard
+  // bounds the whole chain instead of resetting per hop.
   const row = await queryOne<Job>(
     pool,
-    `INSERT INTO jobs (run_id, repo_id) VALUES ($1, $2) RETURNING *`,
-    [runId, repoId],
+    `INSERT INTO jobs (run_id, repo_id, attempts) VALUES ($1, $2, $3) RETURNING *`,
+    [runId, repoId, attempts],
   );
   if (!row) throw new Error("createJob failed");
   return row;
 }
 
 /**
- * Claim up to `limit` queued jobs, skipping repos that already have an
- * active run (one active run per repo) and jobs already claimed.
- * SKIP LOCKED makes concurrent workers safe.
+ * Claim up to `limit` queued jobs, one active run per repo. Two guards
+ * compose here, and both are needed:
+ * - No running/verifying run for the repo (prevents a second run while
+ *   one is in flight).
+ * - No other CLAIMED job for the repo (a claimed job's run is still
+ *   `queued` until processJob starts it, so the run-state guard alone
+ *   lets two queued jobs for one repo through in one batch).
+ * Per-repo serialization uses a transaction-scoped advisory lock
+ * (pg_try_advisory_xact_lock): non-blocking, deadlock-free, and it
+ * makes concurrent workers skip — not fight over — the same repo.
+ * SKIP LOCKED keeps concurrent workers off each other's job rows.
  */
 export async function claimJobs(pool: Pool, limit: number): Promise<Job[]> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const rows = await queryAll<Job>(
+    const candidates = await queryAll<Job>(
       client,
-      `UPDATE jobs SET status = 'claimed', claimed_at = now(),
-         attempts = attempts + 1, updated_at = now()
-       WHERE id IN (
-         SELECT j.id FROM jobs j
-         WHERE j.status = 'queued'
-           AND NOT EXISTS (
-             SELECT 1 FROM repos r WHERE r.id = j.repo_id AND (r.paused OR r.disconnected)
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM runs r
-             JOIN jobs j2 ON j2.run_id = r.id
-             WHERE j2.repo_id = j.repo_id AND r.state IN ('running','verifying')
-           )
-         ORDER BY j.created_at ASC
-         LIMIT $1
-         FOR UPDATE SKIP LOCKED
-       )
-       RETURNING *`,
-      [limit],
+      `SELECT j.* FROM jobs j
+       WHERE j.status = 'queued'
+         AND NOT EXISTS (
+           SELECT 1 FROM repos r WHERE r.id = j.repo_id AND (r.paused OR r.disconnected)
+         )
+       ORDER BY j.created_at ASC
+       LIMIT $1
+       FOR UPDATE SKIP LOCKED`,
+      [limit * 4],
     );
+    const claimed: Job[] = [];
+    for (const job of candidates) {
+      if (claimed.length >= limit) break;
+      const lock = await queryOne<{ ok: boolean }>(
+        client,
+        `SELECT pg_try_advisory_xact_lock(hashtext($1)) AS ok`,
+        [job.repo_id],
+      );
+      if (!lock?.ok) continue;
+      const active = await queryOne<{ n: string }>(
+        client,
+        `SELECT COUNT(*)::text AS n FROM runs r
+         JOIN jobs j2 ON j2.run_id = r.id
+         WHERE j2.repo_id = $1 AND r.state IN ('running','verifying')`,
+        [job.repo_id],
+      );
+      if (Number(active?.n ?? 0) > 0) continue;
+      const alreadyClaimed = await queryOne<{ n: string }>(
+        client,
+        `SELECT COUNT(*)::text AS n FROM jobs
+         WHERE repo_id = $1 AND status = 'claimed' AND id <> $2`,
+        [job.repo_id, job.id],
+      );
+      if (Number(alreadyClaimed?.n ?? 0) > 0) continue;
+      const row = await queryOne<Job>(
+        client,
+        `UPDATE jobs SET status = 'claimed', claimed_at = now(),
+           attempts = attempts + 1, updated_at = now()
+         WHERE id = $1 RETURNING *`,
+        [job.id],
+      );
+      if (row) claimed.push(row);
+    }
     await client.query("COMMIT");
-    return rows;
+    return claimed;
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

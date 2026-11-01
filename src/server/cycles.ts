@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import * as store from "./store";
 import type { Cycle, CycleWinner, Repo, Wish } from "./store";
 import { audit } from "./store";
+import type { Db } from "./db";
 
 export interface RankingEntry {
   wish: Wish;
@@ -9,7 +10,7 @@ export interface RankingEntry {
 }
 
 export async function rankOpenWishes(
-  pool: Pool,
+  pool: Db,
   repoId: string,
 ): Promise<RankingEntry[]> {
   const wishes = await store.listWishes(pool, repoId, "open");
@@ -47,7 +48,7 @@ export interface AnomalyDetails {
  * warning to the human on the approval screen, never an automatic block.
  */
 export async function detectAnomaly(
-  pool: Pool,
+  pool: Db,
   repoId: string,
   openedAt: Date,
 ): Promise<AnomalyDetails | null> {
@@ -102,6 +103,11 @@ export interface CloseResult {
  * No winner below threshold: the cycle still closes (a new one opens)
  * and nothing is proposed. Nothing runs at this stage — the maintainer
  * approval gate comes next, and it is non-negotiable.
+ *
+ * The whole close-and-propose runs in ONE transaction with a
+ * conditional close: a concurrent close of the same cycle fails
+ * (rowcount 0 → "cycle already closed") instead of double-closing,
+ * and the unique index on (cycle_id, wish_id) backstops the propose.
  */
 export async function closeCycleAndPropose(
   pool: Pool,
@@ -109,29 +115,40 @@ export async function closeCycleAndPropose(
   actorId: string,
 ): Promise<CloseResult> {
   if (repo.paused) throw new Error("repo cycles are paused");
-  const cycle = await store.getOpenCycle(pool, repo.id);
-  if (!cycle) throw new Error("no open cycle for this repo");
-  const ranking = await rankOpenWishes(pool, repo.id);
-  const anomaly = await detectAnomaly(pool, repo.id, cycle.opened_at);
-  await store.closeCycle(pool, cycle.id, anomaly !== null, anomaly);
-  const newCycle = await store.openCycle(pool, repo.id);
-  void newCycle;
-  const top = ranking[0];
-  let winner: CycleWinner | null = null;
-  if (top && top.votes >= repo.config.minVotes) {
-    winner = await store.createWinner(pool, cycle.id, top.wish.id);
-    await store.setWishState(pool, top.wish.id, "proposed");
-    await audit(pool, actorId, "cycle_winner_proposed", "wish", top.wish.id, null, {
-      cycleId: cycle.id,
-      votes: top.votes,
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const cycle = await store.getOpenCycle(client, repo.id);
+    if (!cycle) throw new Error("no open cycle for this repo");
+    const ranking = await rankOpenWishes(client, repo.id);
+    const anomaly = await detectAnomaly(client, repo.id, cycle.opened_at);
+    const closed = await store.closeCycle(client, cycle.id, anomaly !== null, anomaly);
+    if (!closed) throw new Error("cycle already closed");
+    const newCycle = await store.openCycle(client, repo.id);
+    void newCycle;
+    const top = ranking[0];
+    let winner: CycleWinner | null = null;
+    if (top && top.votes >= repo.config.minVotes) {
+      winner = await store.createWinner(client, cycle.id, top.wish.id);
+      await store.setWishState(client, top.wish.id, "proposed");
+      await audit(client, actorId, "cycle_winner_proposed", "wish", top.wish.id, null, {
+        cycleId: cycle.id,
+        votes: top.votes,
+        anomaly,
+      });
+    }
+    await audit(client, actorId, "cycle_closed", "cycle", cycle.id, null, {
+      winnerId: winner?.id ?? null,
       anomaly,
     });
+    await client.query("COMMIT");
+    return { cycle: { ...cycle, closed_at: new Date() }, winner, ranking, anomaly };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
-  await audit(pool, actorId, "cycle_closed", "cycle", cycle.id, null, {
-    winnerId: winner?.id ?? null,
-    anomaly,
-  });
-  return { cycle: { ...cycle, closed_at: new Date() }, winner, ranking, anomaly };
 }
 
 /**
@@ -145,15 +162,32 @@ export async function maintainerPick(
   wishId: string,
   actorId: string,
 ): Promise<CycleWinner> {
-  const wish = await store.getWish(pool, wishId);
-  if (!wish || wish.repo_id !== repo.id) throw new Error("wish not found on this repo");
-  if (wish.state !== "open") throw new Error("only open wishes can be picked");
-  let cycle = await store.getOpenCycle(pool, repo.id);
-  if (!cycle) cycle = await store.openCycle(pool, repo.id);
-  const winner = await store.createWinner(pool, cycle.id, wishId);
-  await store.setWishState(pool, wishId, "proposed");
-  await audit(pool, actorId, "winner_picked_by_maintainer", "wish", wishId, null, {
-    cycleId: cycle.id,
-  });
-  return winner;
+  // Locked transaction: two concurrent picks of the same wish must not
+  // both succeed — the wish row lock serializes them, and the second
+  // sees `proposed` and fails.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      `SELECT * FROM wishes WHERE id = $1 FOR UPDATE`,
+      [wishId],
+    );
+    const wish = locked.rows[0] as Wish | undefined;
+    if (!wish || wish.repo_id !== repo.id) throw new Error("wish not found on this repo");
+    if (wish.state !== "open") throw new Error("only open wishes can be picked");
+    let cycle = await store.getOpenCycle(client, repo.id);
+    if (!cycle) cycle = await store.openCycle(client, repo.id);
+    const winner = await store.createWinner(client, cycle.id, wishId);
+    await store.setWishState(client, wishId, "proposed");
+    await audit(client, actorId, "winner_picked_by_maintainer", "wish", wishId, null, {
+      cycleId: cycle.id,
+    });
+    await client.query("COMMIT");
+    return winner;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }

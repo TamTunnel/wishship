@@ -71,6 +71,14 @@ export interface GitHubClient {
   ): Promise<void>;
 }
 
+/** Redact an installation-token URL from any text (git stderr, error
+ * messages, run records). The clone path already scrubbed; pushBranch
+ * did not — its raw git stderr could carry the token URL into a run's
+ * failure_reason. */
+export function scrubTokenUrl(text: string): string {
+  return text.replace(/x-access-token:[^@\s]+@/g, "x-access-token:[redacted]@");
+}
+
 export class OctokitGitHubClient implements GitHubClient {
   private appId: string;
   private privateKey: string;
@@ -120,14 +128,21 @@ export class OctokitGitHubClient implements GitHubClient {
       return true;
     } catch {
       // Star checks via the installation token reflect the installation,
-      // not the user; fall back to the public stargazer list (paginated,
-      // capped) for the eligibility check.
+      // not the user; fall back to the public stargazer list, paged
+      // manually and CAPPED (10 pages x 100) instead of paginating the
+      // entire list for a mega-repo.
       try {
-        const stargazers = await octokit.paginate(
-          octokit.rest.activity.listStargazersForRepo,
-          { owner, repo, per_page: 100 },
-        );
-        return stargazers.some((s: { login: string }) => s.login === login);
+        for (let page = 1; page <= 10; page++) {
+          const res = await octokit.rest.activity.listStargazersForRepo({
+            owner,
+            repo,
+            per_page: 100,
+            page,
+          });
+          if (res.data.some((s: { login: string }) => s.login === login)) return true;
+          if (res.data.length < 100) return false;
+        }
+        return false;
       } catch {
         return false;
       }
@@ -209,6 +224,13 @@ export class OctokitGitHubClient implements GitHubClient {
     const { join } = await import("node:path");
     const url = await this.serviceCloneUrl(installationId, fullName);
     const dir = await mkdtemp(join(tmpdir(), "wishship-push-"));
+    // The patch file lives OUTSIDE the clone: the old code wrote
+    // .wishship.patch inside it and then `git add -A` staged it, so
+    // every PR branch shipped a stray file.
+    const patchFile = join(
+      await mkdtemp(join(tmpdir(), "wishship-patch-")),
+      "patch.diff",
+    );
     try {
       const run = (args: string[], input?: string): Promise<void> =>
         new Promise((resolve, reject) => {
@@ -224,7 +246,12 @@ export class OctokitGitHubClient implements GitHubClient {
           child.on("error", reject);
           child.on("close", (code) => {
             if (code === 0) resolve();
-            else reject(new Error(`git ${args[0]} failed: ${stderr.slice(0, 500)}`));
+            else
+              reject(
+                new Error(
+                  `git ${args[0]} failed: ${scrubTokenUrl(stderr).slice(0, 500)}`,
+                ),
+              );
           });
           if (input !== undefined) {
             child.stdin.write(input);
@@ -236,7 +263,6 @@ export class OctokitGitHubClient implements GitHubClient {
       await run(["clone", "--quiet", url, "."]);
       await run(["checkout", "--quiet", baseCommit]);
       await run(["checkout", "-b", branch]);
-      const patchFile = join(dir, ".wishship.patch");
       await writeFile(patchFile, patch);
       await run(["apply", "--whitespace=nowarn", patchFile]);
       await run(["add", "-A"]);
@@ -253,6 +279,7 @@ export class OctokitGitHubClient implements GitHubClient {
       await run(["push", "--quiet", "origin", branch]);
     } finally {
       await rm(dir, { recursive: true, force: true });
+      await rm(join(patchFile, ".."), { recursive: true, force: true });
     }
   }
 

@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   BACKDOOR_BACKEND,
+  BACKDOOR_COMMENT_BACKEND,
   BIG_BACKEND,
   CHURN_BACKEND,
   DEP_BACKEND,
   drivePipeline,
   EMPTY_BACKEND,
   GOOD_BACKEND,
+  RELATED_FETCH_BACKEND,
   REVIEW_BACKEND,
+  SCRIPT_REWRITE_BACKEND,
   SECRET_BACKEND,
 } from "./pipeline-test-helper";
 import { buildTestApp, makeFixtureRepo, waitForRun } from "./testutil";
@@ -73,13 +76,37 @@ describe("verification pipeline (probes 8, 9, 10, 15)", () => {
     assert.equal(t.github.openedPrs.length, 0);
   });
 
-  test("probe 10: backdoor pattern flags the network call and the review notes it; PR body highlights it", async () => {
+  test("probe 10: backdoor in an unrelated file BLOCKS (no clean VERIFIED PR)", async () => {
+    // Both variants: plain backdoor, and backdoor with a keyword
+    // comment that defeated the old any-token-overlap churn rule.
+    for (const [name, backend] of [
+      ["plain", BACKDOOR_BACKEND],
+      ["keyword-comment", BACKDOOR_COMMENT_BACKEND],
+    ] as const) {
+      const fixture = await makeFixtureRepo(FULL_FIXTURE);
+      const t = await buildTestApp(backend, {}, REVIEW_BACKEND);
+      const out = await drivePipeline(t, {
+        fullName: `acme/ver-c-${name}`,
+        fixture,
+        backend,
+        wishTitle: "Dark mode",
+        wishBody: "Add a dark mode toggle.",
+      });
+      assert.equal(out.run.state, "blocked", name);
+      const churn = out.report?.checks.find((c) => c.name === "churn");
+      assert.equal(churn?.status, "failed", name);
+      assert.match(churn?.detail ?? "", /evil\.js/, name);
+      assert.equal(t.github.openedPrs.length, 0, name);
+    }
+  });
+
+  test("probe 10 (flags preserved): new call in a RELATED file flags, PR still opens", async () => {
     const fixture = await makeFixtureRepo(FULL_FIXTURE);
-    const t = await buildTestApp(BACKDOOR_BACKEND, {}, REVIEW_BACKEND);
+    const t = await buildTestApp(RELATED_FETCH_BACKEND, {}, REVIEW_BACKEND);
     const out = await drivePipeline(t, {
-      fullName: "acme/ver-c",
+      fullName: "acme/ver-c2",
       fixture,
-      backend: BACKDOOR_BACKEND,
+      backend: RELATED_FETCH_BACKEND,
       wishTitle: "Dark mode",
       wishBody: "Add a dark mode toggle.",
     });
@@ -87,13 +114,34 @@ describe("verification pipeline (probes 8, 9, 10, 15)", () => {
     assert.ok(out.pr);
     const net = out.report?.checks.find((c) => c.name === "network_calls");
     assert.equal(net?.status, "flagged");
-    assert.match(net?.detail ?? "", /evil\.example/);
-    const review = out.report?.checks.find((c) => c.name === "second_model_review");
-    assert.equal(review?.status, "flagged");
-    assert.match(review?.detail ?? "", /evil\.example/);
+    assert.match(net?.detail ?? "", /api\.example/);
     const prBody = t.github.openedPrs[0].body;
-    assert.match(prBody, /evil\.example/);
+    assert.match(prBody, /api\.example/);
     assert.match(prBody, /Flags for the reviewer/);
+    assert.match(prBody, /Changed files/);
+    assert.match(prBody, /theme\.js/);
+  });
+
+  test("R1: agent rewriting the test script to a planting no-op does NOT verify", async () => {
+    const fixture = await makeFixtureRepo(FULL_FIXTURE);
+    const t = await buildTestApp(SCRIPT_REWRITE_BACKEND);
+    const out = await drivePipeline(t, {
+      fullName: "acme/ver-r1",
+      fixture,
+      backend: SCRIPT_REWRITE_BACKEND,
+      wishTitle: "Dark mode",
+      wishBody: "Add a dark mode toggle.",
+    });
+    // The pre-agent test command (node theme.test.js) still runs and
+    // passes, but the script change itself is a violation: BLOCKED,
+    // no PR, and the planted marker never proves anything.
+    assert.equal(out.run.state, "blocked");
+    const deps = out.report?.checks.find((c) => c.name === "dependencies");
+    assert.equal(deps?.status, "failed");
+    assert.match(deps?.detail ?? "", /script changed: test/);
+    assert.equal(t.github.openedPrs.length, 0);
+    const tests = out.report?.checks.find((c) => c.name === "tests");
+    assert.match(tests?.detail ?? "", /node theme\.test\.js/);
   });
 
   test("tiers: no-test-suite repo gets PARTIAL with the no-test-suite label, not blocked", async () => {

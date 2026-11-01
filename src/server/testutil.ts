@@ -18,13 +18,39 @@ import * as store from "./store";
 const execFileAsync = promisify(execFile);
 
 export const TEST_SESSION_SECRET = "wishship-test-session-secret";
-export const TEST_DATABASE_URL =
+// Per-process test database: the old shared `wishship_test` DB let one
+// test file's resetDb() TRUNCATE another file's in-flight data ("run
+// vanished", flaky counts across runs). Each test process gets its own
+// database, created on demand from the base URL's credentials.
+const TEST_DB_BASE =
+  process.env.TEST_DATABASE_URL ??
   "postgres://wishship:wishship-dev@127.0.0.1:5432/wishship_test";
+export const TEST_DATABASE_URL = (() => {
+  const url = new URL(TEST_DB_BASE);
+  url.pathname = `/wishship_test_${process.pid}`;
+  return url.toString();
+})();
+
+// Tests run as development: loadConfig() refuses to boot without real
+// secrets unless NODE_ENV is explicitly "development" (fail-closed).
+if (!process.env.NODE_ENV) process.env.NODE_ENV = "development";
 
 let sharedPool: Pool | null = null;
 
 export async function getTestPool(): Promise<Pool> {
   if (!sharedPool) {
+    const adminUrl = new URL(TEST_DATABASE_URL);
+    const dbName = adminUrl.pathname.slice(1);
+    adminUrl.pathname = "/postgres";
+    const admin = createPool(adminUrl.toString());
+    try {
+      await admin.query(`CREATE DATABASE "${dbName}"`);
+    } catch (err) {
+      // 42P04 = already exists (e.g. a previous run's leftover).
+      if ((err as { code?: string }).code !== "42P04") throw err;
+    } finally {
+      await admin.end();
+    }
     sharedPool = createPool(TEST_DATABASE_URL);
     await migrate(sharedPool);
   }

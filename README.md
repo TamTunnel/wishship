@@ -39,8 +39,16 @@ vote → approve → build → verify → review → ship.
    aged accounts can still vote. The maintainer gate is the backstop, not a cure.
 2. **The MVP sandbox is worktree-level isolation plus env hygiene, not a security boundary.**
    The agent can reach the network (it needs its model API). The PR review step is the
-   security boundary for what actually ships. Run agent backends containerized (see
-   Deployment) — per-run containers as mandatory and egress allowlisting are v1.1.
+   security boundary for what actually ships. Read this plainly: in the compose deployment
+   agents run as subprocesses **inside the app container** — compose does **not** run them
+   in a separate container. A same-UID agent can read service environment (including
+   `SESSION_SECRET`, `ENCRYPTION_KEY`, and `DATABASE_URL`) via `/proc/<pid>/environ`, and
+   can read the service's source clone only after the installation token is stripped from
+   it (the clone's remote is removed and `FETCH_HEAD` deleted immediately after cloning).
+   Use branch protection on target repos so a compromised run cannot push outside the PR
+   flow, and treat per-run containers with a different UID plus egress allowlisting as the
+   v1.1 fix — they are not v1. Mandatory per-run containers and egress allowlisting remain
+   the real sandbox fix; the worktree-level sandbox does not confine network access.
 3. **"Verified" means the checks ran with the reported results.** It does not mean the code
    is correct, secure, or free of subtle backdoors. A second-model review is advisory only,
    and no deterministic check catches every malicious pattern. A repo with no test suite gets
@@ -100,27 +108,40 @@ The task spec is a structured JSON document: the wish body sits in a data field,
 concatenated into instructions, and the system prompt states the instruction hierarchy
 (system > developer constraints > wish data). Verification commands come from repo config
 only — a wish claiming a malicious test command has zero effect on what actually runs.
+Verification commands are discovered from the **base commit before the agent runs** and
+passed into verification; they are never re-discovered from the patched tree, so an agent
+that rewrites the test script to a no-op cannot grade its own homework. Second-model
+review reuses the run argv with the review prompt written to a file passed as `{spec}` —
+the wish title never appears in argv, and the review runs in a fresh scratch HOME, never
+the operator's real HOME.
 
 ### Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | `postgres://wishship:wishship-dev@127.0.0.1:5432/wishship` | Postgres connection |
-| `SESSION_SECRET` | (dev fallback; required in prod) | HMAC key for session cookies |
-| `ENCRYPTION_KEY` | (dev fallback; required in prod) | 32 bytes hex, AES-256-GCM key for stored secrets |
+| `SESSION_SECRET` | — (fail-closed, see below) | HMAC key for session cookies |
+| `ENCRYPTION_KEY` | — (fail-closed, see below) | 32 bytes hex, AES-256-GCM key for stored secrets |
 | `BASE_URL` | `http://localhost:3000` | Public URL (OAuth redirect) |
 | `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` | — | GitHub OAuth app |
 | `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_SLUG` | — | GitHub App (installation tokens, PRs) |
 | `GITHUB_CLIENT=fake` | — | Dev-only in-memory GitHub client; never in production |
 | `RUN_TIMEOUT_MINUTES` | `30` | Wall-clock timeout per run (process group killed) |
 | `MAX_CONCURRENT_RUNS` | `2` | Cross-repo concurrency (one active run per repo always) |
-| `RUN_COST_CAP_USD` | — | Per-run cost cap where the backend reports usage |
-| `REPO_MONTHLY_BUDGET_USD` | — | Monthly budget per repo; exhausted cycles queue but do not run |
+| `RUN_COST_CAP_USD` | — | Per-run cost cap, post-hoc and only for cost-reporting backends (script backend via `WISHSHIP_COST`; CLI backends report no cost, so the cap never applies to them — they are time-bounded only). An overrun blocks the PR, it does not stop spend already incurred. |
+| `REPO_MONTHLY_BUDGET_USD` | — | Monthly budget per repo: a **pre-run gate, not a hard cap**. A run that starts under budget can push spend over it; costs are recorded on failed runs too, so the gate sees real totals. |
 | `OPERATOR_LOGINS` | — | Comma-separated logins allowed on operator controls |
-| `AGENT_HOME` | temp dir | HOME dir for agent processes (backend CLI config lives here) |
-| `AGENT_ENV_PASSTHROUGH` | — | Extra env vars passed to agents (denylist always wins) |
+| `AGENT_HOME` | temp dir | HOME fallback for agent processes; every run overrides it with a fresh per-run temp dir, deleted when the run finishes |
+| `AGENT_ENV_PASSTHROUGH` | — | Extra env vars passed to agents (denylist always wins; any `*TOKEN*` / `*SECRET*` / `*PASSWORD*` / `*CREDENTIAL*` name or `*_KEY` suffix is blocked by pattern) |
 
-Per-repo settings (cycle length, vote threshold, age floor 0–365 days, eligibility mode
+**Fail-closed secrets:** dev fallbacks for `SESSION_SECRET` / `ENCRYPTION_KEY` apply only
+when `NODE_ENV` is explicitly `development`. With `NODE_ENV=production` and no secret, the
+service refuses to boot; with `NODE_ENV` unset and no secret, it also refuses to boot —
+a bare-metal deploy can never silently run on a publicly known dev secret. The compose
+file already requires both variables, and the Dockerfile sets `NODE_ENV=production`.
+
+Per-repo settings (cycle length — cycles are closed manually in v1, there is no automatic
+timer; vote threshold, age floor 0–365 days, eligibility mode
 `any` / `stargazers` / `contributors` / `allowlist`, diff limits, draft-vs-ready, extra task
 constraints) are edited by maintainers via `PUT /api/repos/:id/config` and the board UI.
 
@@ -147,44 +168,93 @@ React SPA (Vite) ──► Fastify API ──► Postgres
 something couldn't run — e.g. no test suite), `BLOCKED` (any check failed or hard rule
 tripped — no PR, exactly one retry with verifier feedback, then dead).
 
-**Checks:** tests / lint / typecheck from repo config only; secret scan on added lines;
-diff-size limit (default 500 lines / 20 files, BLOCKED not trimmed); unrelated-churn check
-(flagged, BLOCKED only when unrelated lines are the majority across 2+ files); dependency and
-lockfile changes BLOCKED by default (maintainer may allow a retry with dependencies
-permitted); new outbound hosts flagged, not blocked; second-model review advisory only;
-outside-worktree writes flagged (weak check, honestly labeled).
+**Checks:** tests / lint / typecheck from repo config only, discovered at the base commit
+before the agent runs and never re-discovered from the patched tree; secret scan on added
+lines (shape-based: it catches known token shapes, not split tokens or shapeless
+high-entropy blobs); diff-size limit (default 500 lines / 20 files, BLOCKED not trimmed);
+unrelated-churn check — a file counts as related on path-token overlap or on a token from
+its non-comment added lines, so a keyword comment alone no longer counts; an unrelated
+file with a new outbound call BLOCKS, and a single unrelated file with 20+ added lines
+BLOCKS; dependency, script, and lockfile changes BLOCKED by default (version changes and
+nested manifests included; maintainer may allow a retry with dependencies permitted); new
+outbound hosts flagged, not blocked, where the baseline counts hosts only at actual
+network-call sites in the base tree (a host merely mentioned in a comment does not count);
+dynamically constructed URLs are flagged as `dynamic-url`; second-model review advisory
+only; outside-worktree writes flagged (weak check, honestly labeled).
 
 **Queue:** one worker process, `SKIP LOCKED` claims, one active run per repo, bounded
-cross-repo concurrency. Redis/BullMQ is the documented first scaling step, not a v1
-dependency.
+cross-repo concurrency. Crash recovery re-queues jobs whose run is still `queued`,
+fails stale `running`/`verifying` runs, and carries attempt counts across the recovery
+chain so the attempts guard bounds the whole chain; the stale threshold is
+`max(30min, runTimeout + 10min)` so a long legitimate run is never "recovered"
+mid-flight. The worker re-validates run state immediately before opening a PR, so a
+recovered-while-in-flight run cannot open a second PR. Redis/BullMQ is the documented
+first scaling step, not a v1 dependency.
+
+**Approval surface:** the pending-approval response carries the cycle's anomaly data
+(window votes, total votes, share, account span, window start) and the board UI renders it
+prominently — an anomaly is a warning, not a block. A wish whose body contains
+secret-shaped material is flagged at submission and the body is withheld from the PR body
+entirely; otherwise the wish body is blockquoted so it cannot spoof the verification
+section. Every PR body lists its changed files.
+
+**Reads are public by design:** the board, run records, audit view, and export are
+unauthenticated — transparency is the premise. Run records include capped (500-char)
+failure-log excerpts of agent output; do not paste secrets into wishes or agent prompts.
+
+**PR decisions are maintainer-attested bookkeeping:** the service does not query GitHub
+for merge state — the maintainer's click is the record, which keeps the endpoint
+offline-testable and avoids a new API surface. Merged/shipped states are terminal and
+reject further transitions, and a linked-issue comment is posted only when the issue's
+repo matches the board's repo.
+
+**Injection flagging is English-first:** it covers common instruction-override phrasings
+("ignore all previous instructions", "forget everything above", "pretend/roleplay",
+"developer mode", base64-encoded instructions, "do not follow", "include the API key") plus
+a small set of Spanish/French/German/Portuguese variants — not a multilingual guarantee.
+A flagged wish still runs, with the flag carried on the agent spec.
+
+**States worth knowing:** a wish whose first verification BLOCKS stays `implementing`
+while its one retry is queued — there is no separate `retrying` state in v1; the run
+record and audit show the retry chain. Global pause gates new claims **and** PR opening,
+so an in-flight run cannot open a PR after the operator pauses.
 
 ## Deployment notes
 
-- **Containerized runs (recommended).** The compose deployment runs the service in a
-  container; run agent backends inside a container with no volume mounts beyond the worktree
-  and no access to the host's credentials. The worktree-level sandbox does not confine
-  network access — treat PR review as the security boundary.
+- **Agents run inside the app container (compose).** The compose deployment does **not**
+  run agent backends in a separate container: they are subprocesses of the service, under
+  the same UID. That means a malicious agent can read service environment via
+  `/proc/<pid>/environ` (see Honest limits §2). If you need stronger isolation before
+  v1.1, run the service itself in a throwaway environment with no other credentials on
+  the host, and keep branch protection on every target repo. Per-run containers with a
+  different UID plus egress allowlisting are the v1.1 fix.
 - **GitHub App permissions (minimal):** contents write + pull requests only. No admin, no
   secrets access. Use branch protection on target repos.
 - **Kill switches (all one-click, all audited):** pause a repo's cycles, disconnect a repo
-  (revokes the installation), global pause on agent runs (operator page).
-- **Secrets:** installation tokens are short-lived and never stored. Stored operator secrets
-  are encrypted at rest (AES-256-GCM, key from environment). KMS integration is out of v1 —
-  the operator key is the documented trust point.
+  (revokes the installation), global pause on agent runs (operator page). Re-linking a
+  disconnected repo does **not** re-enable it — only an explicit maintainer reconnect
+  does, and linking a repo requires the caller to be a maintainer of that repo.
+- **Secrets:** installation tokens are short-lived and never stored. The service clone's
+  token-bearing remote is stripped immediately after cloning, and token URLs are scrubbed
+  from git error output. Stored operator secrets are encrypted at rest (AES-256-GCM, key
+  from environment). KMS integration is out of v1 — the operator key is the documented
+  trust point.
 
 ## Development
 
 ```sh
 npm install
 npm run build        # server (dist/) + client (client/dist/)
-npm test             # needs Postgres; uses wishship_test (see below)
+npm test             # needs Postgres; per-process test DBs (see below)
 npm run typecheck
 npm run lint         # eslint + stale-artifact check (no .js/.d.ts next to .ts)
 ```
 
-Tests use a real Postgres database (`wishship_test`, user `wishship`). Start Postgres 16
-locally and create it, or point `TEST_DATABASE_URL` at your own instance (the test helper
-reads the fixed `wishship_test` URL — see `src/server/testutil.ts`).
+Tests use a real Postgres database: each test process gets its own database
+(`wishship_test_<pid>`, user `wishship`, created on demand from `TEST_DATABASE_URL` or
+the default `wishship_test` base URL) so test files cannot wipe each other's in-flight
+data. Start Postgres 16 locally and create the user, or point `TEST_DATABASE_URL` at
+your own instance (see `src/server/testutil.ts`).
 
 ```sh
 # Ubuntu example
@@ -223,6 +293,9 @@ Monorepo special-casing is out of v1.
 
 - Opt-in auto-run mode for explicitly trusted repos (default off).
 - Per-run containers as mandatory; egress allowlisting (model API + registry only).
+  Until then, two residuals stand: a same-UID agent can read service env via
+  `/proc/<pid>/environ`, and `setsid` descendants of an agent process survive the
+  timeout's process-group kill (normal children are killed).
 - AgentCred attestation: "this PR was produced by agent X under spec version Y", verifiable.
 - Hash-chained audit log, if a customer asks for tamper-evidence.
 - Webhooks for live updates (v1 polls; webhooks add a signature-verification surface).

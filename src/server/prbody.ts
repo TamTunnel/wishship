@@ -1,4 +1,5 @@
 import type { CheckResult, Tier, Wish } from "./store";
+import { scanSecrets } from "./secretscan";
 
 export interface PrBodyInput {
   wish: Wish;
@@ -9,6 +10,7 @@ export interface PrBodyInput {
   durationMs: number | null;
   costUsd: string | null;
   runId: string;
+  filesChanged: string[];
 }
 
 /**
@@ -18,6 +20,12 @@ export interface PrBodyInput {
  * duration/cost, and a clear generated-by-an-agent disclosure. It never
  * carries tokens, and never carries full check output (that stays in
  * the run record on the board).
+ *
+ * Two hardening rules:
+ * - The wish body is blockquoted, never raw: a wish containing a fake
+ *   "## Verification" section used to spoof the report section below.
+ * - A wish body with secret-shaped material is WITHHELD entirely, not
+ *   quoted: the old code shipped wish bodies verbatim into PRs.
  */
 export function buildPrBody(input: PrBodyInput): string {
   const lines: string[] = [];
@@ -26,7 +34,23 @@ export function buildPrBody(input: PrBodyInput): string {
   lines.push(`**${input.wish.title}** — ${input.votes} vote${input.votes === 1 ? "" : "s"}`);
   lines.push(``);
   if (input.wish.body) {
-    lines.push(input.wish.body);
+    const secretHits = scanSecrets(input.wish.body);
+    if (secretHits.length > 0) {
+      lines.push(
+        `> [Wish body withheld: secret-shaped material detected (${secretHits.join(", ")}). ` +
+          `See the wish on the board; do not paste secrets into wishes.]`,
+      );
+    } else {
+      for (const line of input.wish.body.split("\n")) {
+        lines.push(`> ${line}`);
+      }
+    }
+    lines.push(``);
+  }
+  if (input.filesChanged.length > 0) {
+    lines.push(`## Changed files`);
+    lines.push(``);
+    for (const f of input.filesChanged) lines.push(`- \`${f}\``);
     lines.push(``);
   }
   lines.push(`## Verification — ${input.tier}`);

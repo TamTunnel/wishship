@@ -221,7 +221,7 @@ function BoardView({
   };
 
   if (!data) return <p>Loading…</p>;
-  const { repo, board, pending } = data;
+  const { repo, board, pending, anomaly } = data;
 
   return (
     <div>
@@ -245,6 +245,22 @@ function BoardView({
             <strong>{pending.wish.title}</strong> — awaiting maintainer approval before any agent
             runs.
           </p>
+          {anomaly?.suspected && (
+            <p>
+              <span className="flag">
+                ⚠ Anomaly suspected in this cycle&apos;s votes:{" "}
+                {String(anomaly.details?.windowVotes ?? "?")} of{" "}
+                {String(anomaly.details?.totalVotes ?? "?")} votes (
+                {String(
+                  Math.round(((anomaly.details?.share as number | undefined) ?? 0) * 100),
+                )}
+                %) arrived within one hour from accounts created within{" "}
+                {String(anomaly.details?.accountSpanDays ?? "?")} days of each other
+                (window start {String(anomaly.details?.windowStart ?? "?")}). This is a
+                warning, not a block — approve only if the votes look genuine.
+              </span>
+            </p>
+          )}
           <div className="row">
             <button
               className="primary"
@@ -280,6 +296,14 @@ function BoardView({
                 <p>
                   <span className="flag">
                     Flagged: {w.injection_patterns.join(", ")} — wish text is data, not instructions.
+                  </span>
+                </p>
+              )}
+              {w.secret_flag && (
+                <p>
+                  <span className="flag">
+                    Flagged: possible secret-shaped material ({w.secret_patterns.join(", ")}) —
+                    withheld from PR bodies; scrub before approving.
                   </span>
                 </p>
               )}

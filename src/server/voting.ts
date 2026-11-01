@@ -69,11 +69,13 @@ export async function votesInLastHour(
   pool: Pool,
   voterId: number,
 ): Promise<number> {
+  // Counts ALL votes created in the window, including withdrawn ones:
+  // the old withdrawn_at IS NULL filter let vote/unvote churn evade
+  // the caps entirely.
   const row = await queryOne<{ n: string }>(
     pool,
     `SELECT COUNT(*)::text AS n FROM votes
-     WHERE voter_id = $1 AND created_at >= now() - interval '1 hour'
-       AND withdrawn_at IS NULL`,
+     WHERE voter_id = $1 AND created_at >= now() - interval '1 hour'`,
     [voterId],
   );
   return Number(row?.n ?? 0);
@@ -83,8 +85,7 @@ export async function votesToday(pool: Pool, voterId: number): Promise<number> {
   const row = await queryOne<{ n: string }>(
     pool,
     `SELECT COUNT(*)::text AS n FROM votes
-     WHERE voter_id = $1 AND created_at >= date_trunc('day', now())
-       AND withdrawn_at IS NULL`,
+     WHERE voter_id = $1 AND created_at >= date_trunc('day', now())`,
     [voterId],
   );
   return Number(row?.n ?? 0);

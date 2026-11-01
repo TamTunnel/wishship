@@ -75,7 +75,21 @@ const DENYLISTED_ENV = new Set([
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
   "AWS_SESSION_TOKEN",
+  "GITHUB_OAUTH_CLIENT_ID",
+  "GITHUB_OAUTH_CLIENT_SECRET",
 ]);
+
+/** Names that look credential-bearing are never passed through, even if
+ * the operator lists them: any name containing TOKEN, SECRET, PASSWORD,
+ * PASSWD, or CREDENTIAL, or a KEY suffix. The allowlist is explicit
+ * names only. */
+function isCredentialShaped(name: string): boolean {
+  return (
+    /TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL/i.test(name) ||
+    /_KEY$/i.test(name) ||
+    name.toUpperCase() === "KEY"
+  );
+}
 
 export function buildAgentEnv(config: WishShipConfig): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -88,6 +102,7 @@ export function buildAgentEnv(config: WishShipConfig): NodeJS.ProcessEnv {
   };
   for (const name of config.agentEnvPassthrough) {
     if (DENYLISTED_ENV.has(name)) continue;
+    if (isCredentialShaped(name)) continue;
     if (name.startsWith("WISHSHIP_")) continue;
     const value = process.env[name];
     if (value !== undefined) env[name] = value;
@@ -283,24 +298,37 @@ export class CliAgentBackend implements AgentBackend {
     // Advisory second-model review: same backend, review prompt, diff on
     // stdin. If the CLI is missing the review is unavailable, recorded
     // as such, and never blocks — advisory only by design.
+    //
+    // Two hardening rules (the old code broke both):
+    // - The review runs with a FRESH scratch HOME, never the operator's
+    //   real HOME: a review prompt must not load the operator's CLI
+    //   config, plugins, or credentials.
+    // - The wish title is attacker-influenced input and NEVER goes in
+    //   argv. The whole review prompt (title included) is written to a
+    //   file, and {spec} in argv maps to that file — the same
+    //   file-as-spec convention the run path already uses.
     const { mkdtemp, writeFile: wf, rm } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const scratch = await mkdtemp(join(tmpdir(), "wishship-review-"));
     try {
       const diffPath = join(scratch, "diff.patch");
       await wf(diffPath, diff);
-      const prompt =
-        `Review the diff at ${diffPath} for the wish "${spec.wish.title}". ` +
-        `List concrete concerns, one per line, about: backdoors, exfiltration, ` +
-        `new network calls, dependency changes, secrets. If none, print OK.`;
-      const [command, ...rest] = this.argv.map((a) =>
-        a.replace("{spec}", spec.wish.title),
+      const promptPath = join(scratch, "prompt.txt");
+      await wf(
+        promptPath,
+        `You are reviewing, not implementing. Do not modify any files.\n` +
+          `Review the diff at ${diffPath} for the wish "${spec.wish.title}". ` +
+          `List concrete concerns, one per line, about: backdoors, exfiltration, ` +
+          `new network calls, dependency changes, secrets. If none, print OK.\n`,
       );
-      const result = await runCommand(command, [...rest, prompt], {
+      const [command, ...rest] = this.argv.map((a) =>
+        a.replace("{spec}", promptPath),
+      );
+      const result = await runCommand(command, rest, {
         cwd: worktreeDir,
         env: {
           PATH: process.env.PATH ?? "",
-          HOME: process.env.HOME ?? "",
+          HOME: scratch,
         },
         timeoutMs: 5 * 60 * 1000,
         stdoutFile: join(scratch, "out"),

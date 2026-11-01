@@ -13,7 +13,8 @@ import { randomId } from "./config";
 import { closeCycleAndPropose, maintainerPick } from "./cycles";
 import type { GitHubClient } from "./github";
 import { scanInjection } from "./injection";
-import { createRunForWinner, type Worker } from "./runner";
+import { scanSecrets } from "./secretscan";
+import { approveWinnerAndCreateRun, type Worker } from "./runner";
 import * as store from "./store";
 import { audit } from "./store";
 import {
@@ -133,6 +134,22 @@ function bodyOf(req: FastifyRequest): Record<string, unknown> {
   return (req.body ?? {}) as Record<string, unknown>;
 }
 
+/**
+ * The anomaly belongs to the CLOSED cycle that proposed this winner —
+ * not the currently open cycle. The old pending response carried no
+ * anomaly data at all, so the approval screen could never show the
+ * flag the spec requires "prominently, with the underlying numbers".
+ */
+async function pendingAnomaly(
+  pool: Pool,
+  pending: { cycle_id: string } | null,
+): Promise<{ suspected: boolean; details: unknown } | null> {
+  if (!pending) return null;
+  const cycle = await store.getCycle(pool, pending.cycle_id);
+  if (!cycle || !cycle.anomaly_suspected) return null;
+  return { suspected: true, details: cycle.anomaly_details };
+}
+
 function asString(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
@@ -140,6 +157,21 @@ function asString(v: unknown): string | null {
 export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   const { pool, config, github } = deps;
   const throttle = new IpThrottle();
+
+  // Write throttle: the old IpThrottle covered board reads only, so a
+  // single IP could hammer every write endpoint. Writes are also
+  // authenticated and DB-rate-limited (votes/wishes), but the shared
+  // 120/min/IP throttle now bounds bursts on all /api/ writes too.
+  app.addHook("onRequest", async (req, reply) => {
+    if (
+      (req.method === "POST" || req.method === "PUT") &&
+      req.url.split("?")[0].startsWith("/api/")
+    ) {
+      if (!throttle.check(ipOf(req))) {
+        return reply.code(429).send({ error: "rate limited, try again shortly" });
+      }
+    }
+  });
 
   app.get("/api/health", async () => ({ ok: true, version: "0.1.0" }));
 
@@ -214,9 +246,37 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     if (!repos.some((r) => r.fullName === fullName)) {
       return reply.code(400).send({ error: "installation does not cover this repo" });
     }
+    // Linking is a maintainer act: the old code let ANY authenticated
+    // user link any installation-covered repo (sequential, guessable
+    // ids), and re-linking silently re-enabled disconnected repos.
+    const probe: store.Repo = {
+      id: "",
+      installation_id: installationId,
+      full_name: fullName,
+      config: store.DEFAULT_REPO_CONFIG,
+      paused: false,
+      disconnected: false,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    if (!(await requireMaintainer(deps, probe, user, reply))) return;
     const repo = await store.createRepo(pool, installationId, fullName);
     await audit(pool, String(user.id), "repo_linked", "repo", repo.id, null, { fullName });
     return { repo };
+  });
+
+  app.post("/api/repos/:id/reconnect", async (req, reply) => {
+    const user = requireAuth(req, reply, config);
+    if (!user) return;
+    const repo = await store.getRepo(pool, (req.params as { id: string }).id);
+    if (!repo) return reply.code(404).send({ error: "repo not found" });
+    if (!(await requireMaintainer(deps, repo, user, reply))) return;
+    // Explicit maintainer reconnect: the ONLY path that clears
+    // `disconnected`. Re-linking a disconnected repo leaves it
+    // disconnected (see createRepo).
+    await store.setRepoDisconnected(pool, repo.id, false);
+    await audit(pool, String(user.id), "repo_reconnected", "repo", repo.id, null, {});
+    return { disconnected: false };
   });
 
   app.get("/api/repos/:id", async (req, reply) => {
@@ -234,7 +294,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const board = await store.getBoard(pool, repo.id);
     const cycle = await store.getOpenCycle(pool, repo.id);
     const pending = await store.getPendingWinner(pool, repo.id);
-    return { repo, board, cycle, pending };
+    return { repo, board, cycle, pending, anomaly: await pendingAnomaly(pool, pending) };
   });
 
   app.get("/api/repos/:id/config", async (req, reply) => {
@@ -322,6 +382,11 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return reply.code(429).send({ error: "wish submission limit reached for today" });
     }
     const patterns = scanInjection(`${title}\n${wishBody}`);
+    // Secret-shaped material in the wish body is flagged at submission
+    // (not blocking) and, crucially, WITHHELD from the PR body — the
+    // old code shipped wish bodies verbatim into PRs, including any
+    // secret-shaped text they contained.
+    const secretPatterns = scanSecrets(`${title}\n${wishBody}`);
     const wish = await store.createWish(
       pool,
       repo.id,
@@ -331,10 +396,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       linked,
       patterns.length > 0,
       patterns,
+      secretPatterns.length > 0,
+      secretPatterns,
     );
     await audit(pool, String(user.id), "wish_submitted", "wish", wish.id, null, {
       title,
       injectionFlag: patterns.length > 0,
+      secretFlag: secretPatterns.length > 0,
     });
     return reply.code(201).send({ wish });
   });
@@ -439,7 +507,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const pending = await store.getPendingWinner(pool, repo.id);
     if (!pending) return { pending: null };
     const count = await store.voteCount(pool, pending.wish_id);
-    return { pending, voteCount: count };
+    return { pending, voteCount: count, anomaly: await pendingAnomaly(pool, pending) };
   });
 
   app.post("/api/repos/:id/pick", async (req, reply) => {
@@ -479,12 +547,17 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return reply.code(400).send({ error: "script backend is not configured on this instance" });
     }
     const allowDependencies = bodyOf(req).allowDependencies === true;
-    await store.decideWinner(pool, winner.id, "approved", user.id, null);
-    await store.setWishState(pool, wish.id, "approved");
-    await audit(pool, String(user.id), "winner_approved", "wish", wish.id, null, { backend });
+    // Atomic: decide + wish-state + run creation in one transaction.
+    // A run-creation failure no longer strands an approved winner.
     try {
-      const run = await createRunForWinner(pool, winner.id, backend, allowDependencies, String(user.id));
-      return { winner: { ...winner, state: "approved" as const }, run };
+      const result = await approveWinnerAndCreateRun(
+        pool,
+        winner.id,
+        backend,
+        allowDependencies,
+        String(user.id),
+      );
+      return { winner: result.winner, run: result.run };
     } catch (err) {
       return reply.code(400).send({ error: (err as Error).message });
     }
@@ -504,7 +577,10 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return reply.code(409).send({ error: `winner is ${winner.state}` });
     }
     const reason = asString(bodyOf(req).reason);
-    await store.decideWinner(pool, winner.id, "rejected", user.id, reason);
+    const decided = await store.decideWinner(pool, winner.id, "rejected", user.id, reason);
+    if (!decided) {
+      return reply.code(409).send({ error: `winner is no longer pending approval` });
+    }
     // Rejection returns the wish to open; no auto-advance to runner-up.
     await store.setWishState(pool, wish.id, "open");
     await audit(pool, String(user.id), "winner_rejected", "wish", wish.id, null, { reason });
@@ -552,6 +628,20 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const repo = await store.getRepo(pool, wish.repo_id);
     if (!repo) return reply.code(404).send({ error: "repo not found" });
     if (!(await requireMaintainer(deps, repo, user, reply))) return;
+    // Guards the old code lacked: retrying a shipped/rejected wish
+    // resurrected it, and retrying while a run was active duplicated
+    // runs. Only open/needs_input wishes with no active run qualify.
+    if (wish.state !== "open" && wish.state !== "needs_input") {
+      return reply.code(409).send({ error: `wish is ${wish.state}, cannot retry` });
+    }
+    const active = await pool.query(
+      `SELECT COUNT(*)::text AS n FROM runs
+       WHERE winner_id = $1 AND state IN ('queued','running','verifying')`,
+      [winner.id],
+    );
+    if (Number(active.rows[0].n) > 0) {
+      return reply.code(409).send({ error: "winner already has an active run" });
+    }
     const retry = await store.createRun(pool, winner.id, run.backend, true, run.id);
     await store.createJob(pool, retry.id, repo.id);
     await audit(pool, String(user.id), "run_retried_with_deps", "run", retry.id, null, {
@@ -574,6 +664,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const repo = await store.getRepo(pool, wish.repo_id);
     if (!repo) return reply.code(404).send({ error: "repo not found" });
     if (!(await requireMaintainer(deps, repo, user, reply))) return;
+    // Terminal-state guard: the old code let merged → rejected flip a
+    // shipped wish to rejected and close the PR, both 200. Shipped and
+    // merged are terminal; no further transition is accepted.
+    if (wish.state === "shipped" || pr.state === "merged") {
+      return reply.code(409).send({ error: "PR is already merged; decision is terminal" });
+    }
     const outcome = asString(bodyOf(req).outcome);
     const reason = asString(bodyOf(req).reason);
     if (outcome === "merged") {
@@ -581,10 +677,14 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await store.setPrState(pool, pr.id, "merged");
       await audit(pool, String(user.id), "pr_merged", "wish", wish.id, null, { prNumber: pr.number });
       // One optional comment on a linked issue, best effort, no chatter.
-      const issueMatch = wish.linked_issue_url?.match(/\/issues\/(\d+)/);
-      if (issueMatch) {
+      // The linked issue's repo must match this board's repo: a wish
+      // linking another repo's issue must never comment there.
+      const issueMatch = wish.linked_issue_url?.match(
+        /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)/,
+      );
+      if (issueMatch && issueMatch[1] === repo.full_name) {
         await github
-          .commentOnIssue(repo.installation_id, repo.full_name, Number(issueMatch[1]),
+          .commentOnIssue(repo.installation_id, repo.full_name, Number(issueMatch[2]),
             `Shipped via WishShip PR #${pr.number}: ${pr.url}`)
           .catch(() => undefined);
       }
