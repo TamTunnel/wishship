@@ -45,19 +45,25 @@ vote → approve → build → verify → review → ship.
   verification, because check commands are pinned to the base discovery. The addition is
   diff content the maintainer reviews in the draft PR. Changing or removing a script key
   that exists at base still blocks, as do dependency adds and lockfile changes.
-- **Split tokens are caught.** The secret scan covers the whole added-lines text joined
-  together plus actual join operations in the diff (`a + b` with both sides resolved
-  through same-diff assignments, and template literals). A token split across lines or
-  rebuilt from quoted fragments fails the scan. Mere adjacency without a join operator
+- **Split tokens are caught.** The secret scan resolves the runtime values of variables
+  and bare expressions in the added lines — not just known shapes — and scans those
+  values against the secret patterns: `+` chains of any length, template literals,
+  `.concat()`, `.join()` (literal or variable separator, default `,`), literal,
+  spread, and push-built arrays, `String.fromCharCode()`, and values propagated
+  through intermediate assignments. A token split across lines or rebuilt from quoted
+  fragments fails the scan. Mere adjacency without a join operator
   is NOT flagged: concatenating neighboring literals fabricated tokens that do not exist
   in the source (it once blocked a JSON env dump, where `"1"` + `"PATH"` + the PATH
-  value formed a 40-character slash run tripping the AWS-secret shape).
+  value formed a 40-character slash run tripping the AWS-secret shape). Unresolvable
+  expressions (other function calls, member access, values from outside the diff) stay
+  unknown and are never flagged alone.
 - **Churn override (maintainer-only, audited).** When a run blocks ONLY on the churn-size
   heuristic — e.g. a legitimate 30-line helper with no relation to the wish — the
   maintainer can attest the unrelated files are legitimate, either up front
   (`allowChurn` on approve) or after the block
   (`POST /api/runs/:id/retry-with-churn-override`). The override is recorded on the run
-  record (`allow_churn`), audited (`run_retried_with_churn_override`), and noted in the
+  record (`allow_churn`), audited (`run_retried_with_churn_override` for the retry path,
+  `run_approved_with_churn_override` for the approve-time path), and noted in the
   PR body. It downgrades ONLY the size heuristic to flagged: an unrelated file with a
   new outbound call (the backdoor shape) still blocks, and non-maintainers are refused
   (403). The automatic retry runs first, so the override applies once that retry has
