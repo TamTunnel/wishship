@@ -142,19 +142,35 @@ export function scanSecrets(text: string): string[] {
  *   concatenate in order to a secret pattern is flagged even when
  *   the body is intractable — honest code never passes fragments
  *   that concatenate to a secret into a helper except to rebuild one.
+ * - multi-valued results (round 6b): when a diff-defined call's body
+ *   yields several possible returns, the call result is the SET of
+ *   those values (capped at 16, branch order), and `+`, `concat`,
+ *   `join`, string methods, member/index reads, template
+ *   substitutions, and `String`/`atob`/decoder calls distribute over
+ *   the set — so a branchy helper's fragments combined with further
+ *   expressions at the call site are caught. Plus the
+ *   resolved-argument fallback: the conservative fallback above,
+ *   computed over RESOLVED argument values (variables bound to
+ *   literals/arrays in the diff, sets fanning out to their members)
+ *   instead of raw literals, so fragments held in variables are
+ *   caught even when the helper body is intractable. An argument
+ *   that does not fully resolve skips the resolved fallback for
+ *   that call (its fragments are still scanned individually).
  *
  * Deliberately NOT modeled (stays unknown, never flagged alone):
  * - recursion, closures over mutated state, classes, `eval`, and
  *   genuinely complex control flow (classic `for` loops, `while`,
  *   `switch`, `try` bodies are skipped, not interpreted — a helper
- *   with such a body is still caught when called with literal
- *   fragments, via the fallback below, but not when the fragments
- *   arrive via variables); method calls on objects whose property
- *   is a multi-path function (single-path object methods DO resolve);
- *   multi-path call results combined with further expressions (a
- *   branchy helper returning one fragment, concatenated with another
- *   fragment at the call site — each branch outcome is scanned, but
- *   not the combination)
+ *   with such a body is still caught when called with fragments,
+ *   literal or variable-held, via the fallbacks, but a body that
+ *   TRANSFORMS its inputs rather than forwarding them is not
+ *   modeled); method calls on objects whose property is a
+ *   multi-path function (single-path object methods DO resolve);
+ *   `for...of` over a multi-valued (set) array; builtin calls whose
+ *   arguments are sets other than the distributed operations above
+ *   (e.g. `Buffer.from`, `JSON.parse`, `fromCharCode` with a set
+ *   argument); function-valued `replace` callbacks whose body is
+ *   multi-path; spreading a set value as call arguments
  * - function calls other than the ones above, and values that come
  *   from outside the diff (base code, imports, parameters, runtime
  *   input) — including the half-in-base case: a diff that adds only
@@ -198,6 +214,19 @@ type RegexVal = { kind: "regex"; pattern: string; flags: string };
 type TextDecoderVal = { kind: "textdecoder" };
 type TextEncoderVal = { kind: "textencoder" };
 type FuncVal = { kind: "function"; def: FuncDef };
+/**
+ * Multi-valued result (round 6b): when a diff-defined call's body
+ * yields several possible returns (unknown-condition branches), the
+ * call result is the SET of those values, not unknown — so later
+ * operations distribute over the set and combinations that form a
+ * secret are caught (previously each branch outcome was scanned
+ * alone, but never combined with further expressions at the call
+ * site). Members are never sets (flattened on construction) and
+ * never null (filtered); the set is capped at SET_CAP values, first
+ * in branch order — truncation keeps genuine possible values, so it
+ * can only miss a combination past the cap, never fabricate one.
+ */
+type SetVal = { kind: "set"; values: Value[] };
 type Value =
   | StrVal
   | NumVal
@@ -207,7 +236,67 @@ type Value =
   | TextDecoderVal
   | TextEncoderVal
   | FuncVal
+  | SetVal
   | null;
+
+const SET_CAP = 16;
+
+/** Build a set value: flatten nested sets, drop nulls, dedup scalars, cap. */
+function makeSet(values: Value[]): Value {
+  const out: Value[] = [];
+  const seen = new Set<string>();
+  const push = (v: Value): void => {
+    if (v === null) return;
+    if (v.kind === "set") {
+      for (const m of v.values) push(m);
+      return;
+    }
+    if (v.kind === "string" || v.kind === "number") {
+      const k = `${v.kind}:${String(v.value)}`;
+      if (seen.has(k)) return;
+      seen.add(k);
+    }
+    out.push(v);
+  };
+  for (const v of values) push(v);
+  if (out.length === 0) return null;
+  if (out.length === 1) return out[0];
+  return { kind: "set", values: out.slice(0, SET_CAP) };
+}
+
+/**
+ * Distribute fn over set-valued inputs: the cross product of the
+ * members, capped at SET_CAP results (first in deterministic order).
+ * Inputs without sets call fn directly, unchanged. Null results are
+ * dropped (that combination is unknown); all-null yields null.
+ */
+function distribute(inputs: Value[], fn: (concrete: Value[]) => Value): Value {
+  if (!inputs.some((v) => v !== null && v.kind === "set")) return fn(inputs);
+  const options: Value[][] = inputs.map((v) =>
+    v !== null && v.kind === "set" ? v.values : [v],
+  );
+  const results: Value[] = [];
+  const walk = (idx: number, acc: Value[]): void => {
+    if (results.length >= SET_CAP) return;
+    if (idx === options.length) {
+      const r = fn(acc);
+      if (r !== null) results.push(r);
+      return;
+    }
+    for (const o of options[idx]) {
+      walk(idx + 1, [...acc, o]);
+      if (results.length >= SET_CAP) return;
+    }
+  };
+  walk(0, []);
+  return makeSet(results);
+}
+
+/** Map a possibly-set value through fn, distributing over members. */
+function mapSetValues(v: Value, fn: (x: Value) => Value): Value {
+  if (v === null || v.kind !== "set") return fn(v);
+  return makeSet(v.values.map(fn));
+}
 
 function coerceToString(v: Value): string | null {
   if (v === null) return null;
@@ -223,8 +312,15 @@ function coerceToString(v: Value): string | null {
   return parts.join(",");
 }
 
-/** JS `+` semantics: number + number sums, anything else string-concatenates. */
+/** JS `+` semantics: number + number sums, anything else string-concatenates. Sets distribute. */
 function addValues(a: Value, b: Value): Value {
+  if ((a !== null && a.kind === "set") || (b !== null && b.kind === "set")) {
+    return distribute([a, b], ([x, y]) => addValuesSingle(x, y));
+  }
+  return addValuesSingle(a, b);
+}
+
+function addValuesSingle(a: Value, b: Value): Value {
   if (a !== null && a.kind === "number" && b !== null && b.kind === "number") {
     return { kind: "number", value: a.value + b.value };
   }
@@ -873,6 +969,27 @@ function parseParams(slice: Tok[]): FuncParam[] {
 
 // ---- expression parser (structure-driven; values come from env) ----
 
+/** Index read arr[i] / obj["key"] / str[i] for one concrete receiver. */
+function readIndex(v: Value, idx: Value): Value {
+  if (v !== null && v.kind === "array") {
+    const n = numArg(idx);
+    if (n === null || n === undefined) return null;
+    const item = v.items[n];
+    return item === undefined ? null : item;
+  }
+  if (v !== null && v.kind === "object") {
+    const k = coerceToString(idx);
+    return k === null ? null : (v.props.get(k) ?? null);
+  }
+  if (v !== null && v.kind === "string") {
+    const n = numArg(idx);
+    if (n === null || n === undefined) return null;
+    const ch = v.value[n];
+    return ch === undefined ? null : { kind: "string", value: ch };
+  }
+  return null;
+}
+
 class Parser {
   pos = 0;
   constructor(
@@ -944,14 +1061,44 @@ class Parser {
     let v = this.parsePrimary();
     for (;;) {
       // Bare call to a diff-defined function value: evaluate the body
-      // with arguments bound (round 6). Multi-path bodies yield null
-      // here; the call-site scan pass in scanAddedLines flags secrets
-      // among their possible outcomes.
+      // with arguments bound (round 6). Multi-path bodies yield a SET
+      // of possible returns (round 6b), so later operations
+      // distribute over the branches and combinations forming a
+      // secret are caught; the call-site scan pass in scanAddedLines
+      // additionally flags secrets among the outcomes themselves.
       if (v !== null && v.kind === "function" && this.peekPunct("(")) {
         this.pos++;
         const args = this.parseArgs();
         const outs = evaluateFunction(v.def, args, this.env, this.ctx);
-        v = outs.length === 1 ? outs[0] : null;
+        v = makeSet(outs);
+        continue;
+      }
+      // Set receiver with a postfix chain (round 6b): evaluate the
+      // whole remaining chain per member, reusing all existing
+      // method/member/index logic with zero duplication. Each member
+      // is bound to a temp identifier and the chain tokens are
+      // re-parsed against it; a member whose chain does not fully
+      // parse contributes nothing. This is what makes methods,
+      // member reads, index reads, and further calls all distribute
+      // over branch-union results.
+      if (v !== null && v.kind === "set" && (this.peekPunct(".") || this.peekPunct("["))) {
+        const chainEnd = this.findChainEnd();
+        if (chainEnd === this.pos) break;
+        const chainToks = this.toks.slice(this.pos, chainEnd);
+        const results: Value[] = [];
+        for (const m of v.values) {
+          const env2 = new Map(this.env);
+          env2.set("__wishship_set_member_6b", m);
+          const sub = new Parser(
+            [{ t: "ident", v: "__wishship_set_member_6b" }, ...chainToks],
+            env2,
+            this.ctx,
+          );
+          const r = sub.parseExpr();
+          results.push(sub.pos === sub.toks.length ? r : null);
+        }
+        this.pos = chainEnd;
+        v = makeSet(results);
         continue;
       }
       // Postfix ++ / --: JS yields ToNumber(old value).
@@ -1127,8 +1274,9 @@ class Parser {
                   this.env,
                   this.ctx,
                 );
-                if (outs.length !== 1) return null;
-                mapped.push(outs[0]);
+                // Multi-path map results become a set item (round 6b)
+                // rather than killing the whole Array.from.
+                mapped.push(makeSet(outs));
               }
               items = mapped;
             }
@@ -1138,61 +1286,105 @@ class Parser {
           if (member.v === "concat" || member.v === "join") {
             this.pos += 3;
             const args = this.parseArgs();
-            if (member.v === "concat") {
-              if (v === null) return null;
-              if (v.kind === "string") {
-                let out = v.value;
-                for (const a of args) {
-                  const s = coerceToString(a);
-                  if (s === null) return null;
-                  out += s;
+            const out = distribute([v, ...args], (concrete) => {
+              const [rv, ...rest] = concrete;
+              if (member.v === "concat") {
+                if (rv === null) return null;
+                if (rv.kind === "string") {
+                  let sOut = rv.value;
+                  for (const a of rest) {
+                    const s = coerceToString(a);
+                    if (s === null) return null;
+                    sOut += s;
+                  }
+                  return { kind: "string", value: sOut };
                 }
-                v = { kind: "string", value: out };
-              } else if (v.kind === "array") {
-                const items = [...v.items];
-                for (const a of args) {
-                  if (a === null) items.push(null);
-                  else if (a.kind === "array") items.push(...a.items);
-                  else items.push(a);
+                if (rv.kind === "array") {
+                  const items = [...rv.items];
+                  for (const a of rest) {
+                    if (a === null) items.push(null);
+                    else if (a.kind === "array") items.push(...a.items);
+                    else items.push(a);
+                  }
+                  return { kind: "array", items };
                 }
-                v = { kind: "array", items };
-              } else {
                 return null;
               }
-            } else {
-              if (v === null || v.kind !== "array") return null;
-              const sep = args.length === 0 ? "," : coerceToString(args[0]);
+              // join: the receiver array's items may themselves be
+              // sets (round 6b, e.g. [pick(flag), "frag"].join("")),
+              // so the join distributes over each item's options.
+              if (rv === null || rv.kind !== "array") return null;
+              const sep = rest.length === 0 ? "," : coerceToString(rest[0]);
               if (sep === null) return null;
-              const parts: string[] = [];
-              for (const it of v.items) {
-                const s = coerceToString(it);
-                if (s === null) return null;
-                parts.push(s);
+              const itemOpts: string[][] = [];
+              for (const it of rv.items) {
+                if (it !== null && it.kind === "set") {
+                  const opts: string[] = [];
+                  for (const m of it.values) {
+                    const s = coerceToString(m);
+                    if (s !== null) opts.push(s);
+                  }
+                  if (opts.length === 0) return null;
+                  itemOpts.push(opts);
+                } else {
+                  const s = coerceToString(it);
+                  if (s === null) return null;
+                  itemOpts.push([s]);
+                }
               }
-              v = { kind: "string", value: parts.join(sep) };
-            }
+              let combos: string[][] = [[]];
+              for (const opts of itemOpts) {
+                const next: string[][] = [];
+                for (const c of combos) {
+                  for (const o of opts) {
+                    if (next.length >= 256) break;
+                    next.push([...c, o]);
+                  }
+                  if (next.length >= 256) break;
+                }
+                combos = next;
+              }
+              return makeSet(
+                combos.map((c) => ({ kind: "string" as const, value: c.join(sep) })),
+              );
+            });
+            if (out === null) return null;
+            v = out;
             continue;
           }
           // String methods on a resolved string receiver, computed for
-          // real (slice/substring/replace/split/trim/case/...).
+          // real (slice/substring/replace/split/trim/case/...). Set
+          // receivers are intercepted by the chain case above; set
+          // ARGUMENTS still distribute here.
           if (v !== null && v.kind === "string") {
             this.pos += 3;
             const args = this.parseArgs();
-            const out = evalStringMethod(v.value, member.v, args, this.env, this.ctx);
+            const out = distribute([v, ...args], (concrete) => {
+              const [rv, ...rest] = concrete;
+              if (rv === null || rv.kind !== "string") return null;
+              return evalStringMethod(rv.value, member.v, rest, this.env, this.ctx);
+            });
             if (out === null) return null;
             v = out;
             continue;
           }
           // Array methods: at(i) reads an element, toString() joins.
+          // Set receivers are intercepted by the chain case above;
+          // set index arguments still distribute in `at`.
           if (v !== null && v.kind === "array") {
             if (member.v === "at") {
               this.pos += 3;
               const args = this.parseArgs();
-              const idx = numArg(args[0]);
-              if (idx === null || idx === undefined) return null;
-              const item = v.items[idx];
-              if (item === undefined) return null;
-              v = item;
+              const out = distribute([v, ...args], (concrete) => {
+                const [rv, ...rest] = concrete;
+                if (rv === null || rv.kind !== "array") return null;
+                const idx = numArg(rest[0]);
+                if (idx === null || idx === undefined) return null;
+                const item = rv.items[idx];
+                return item === undefined ? null : item;
+              });
+              if (out === null) return null;
+              v = out;
               continue;
             }
             if (member.v === "toString") {
@@ -1206,41 +1398,49 @@ class Parser {
           }
           // TextDecoder().decode(bytes) / TextEncoder().encode(string)
           // (round 6; the byte codec itself is Buffer, which is exact
-          // for UTF-8 — the only label this models).
+          // for UTF-8 — the only label this models). A set of byte
+          // arrays / strings distributes over its members (round 6b).
           if (v !== null && v.kind === "textdecoder" && member.v === "decode") {
             this.pos += 3;
             const args = this.parseArgs();
-            const data = args[0];
-            if (data === undefined || data === null || data.kind !== "array") return null;
-            const bytes: number[] = [];
-            for (const it of data.items) {
-              const n = toNum(it);
-              if (n === null) return null;
-              bytes.push(((Math.trunc(n) % 256) + 256) % 256);
-            }
-            v = { kind: "string", value: Buffer.from(bytes).toString("utf8") };
+            const out = mapSetValues(args[0] ?? null, (data) => {
+              if (data === undefined || data === null || data.kind !== "array") return null;
+              const bytes: number[] = [];
+              for (const it of data.items) {
+                const n = toNum(it);
+                if (n === null) return null;
+                bytes.push(((Math.trunc(n) % 256) + 256) % 256);
+              }
+              return { kind: "string", value: Buffer.from(bytes).toString("utf8") };
+            });
+            if (out === null) return null;
+            v = out;
             continue;
           }
           if (v !== null && v.kind === "textencoder" && member.v === "encode") {
             this.pos += 3;
             const args = this.parseArgs();
-            const data = args[0];
-            if (data === undefined || data === null || data.kind !== "string") return null;
-            v = {
-              kind: "array",
-              items: [...Buffer.from(data.value, "utf8")].map((b) => ({ kind: "number" as const, value: b })),
-            };
+            const out = mapSetValues(args[0] ?? null, (data) => {
+              if (data === undefined || data === null || data.kind !== "string") return null;
+              return {
+                kind: "array",
+                items: [...Buffer.from(data.value, "utf8")].map((b) => ({ kind: "number" as const, value: b })),
+              };
+            });
+            if (out === null) return null;
+            v = out;
             continue;
           }
           // Method call on an object whose property is a diff-defined
-          // function value: evaluate it (round 6).
+          // function value: evaluate it (round 6); multi-path bodies
+          // yield a set of possible returns (round 6b).
           if (v !== null && v.kind === "object") {
             const fn = v.props.get(member.v);
             if (fn !== undefined && fn !== null && fn.kind === "function") {
               this.pos += 3;
               const args = this.parseArgs();
               const outs = evaluateFunction(fn.def, args, this.env, this.ctx);
-              v = outs.length === 1 ? outs[0] : null;
+              v = makeSet(outs);
               continue;
             }
           }
@@ -1253,7 +1453,8 @@ class Parser {
         // resolves the member (round 5); `.length` on a string/array
         // receiver is a number (round 6 — previously the receiver was
         // left unchanged, which over-flagged `secret.length`); on any
-        // other receiver the value is unchanged.
+        // other receiver the value is unchanged. Set receivers are
+        // intercepted by the chain case above.
         if (v !== null && v.kind === "object") {
           v = v.props.get(member.v) ?? null;
         } else if (
@@ -1270,31 +1471,49 @@ class Parser {
         // Index access: arr[i], obj["key"], str[i]. A string index
         // yields a single character (so char-by-char reconstruction
         // still resolves through `+` chains); out of range is unknown.
+        // Set receivers are intercepted by the chain case above.
         this.pos++;
         const idx = this.parseExpr();
         if (!this.peekPunct("]")) return null;
         this.pos++;
-        if (v !== null && v.kind === "array") {
-          const n = numArg(idx);
-          if (n === null || n === undefined) return null;
-          const item = v.items[n];
-          v = item === undefined ? null : item;
-        } else if (v !== null && v.kind === "object") {
-          const k = coerceToString(idx);
-          v = k === null ? null : (v.props.get(k) ?? null);
-        } else if (v !== null && v.kind === "string") {
-          const n = numArg(idx);
-          if (n === null || n === undefined) return null;
-          const ch = v.value[n];
-          v = ch === undefined ? null : { kind: "string", value: ch };
-        } else {
-          v = null;
-        }
+        v = readIndex(v, idx);
         continue;
       }
       break;
     }
     return v;
+  }
+
+  /** Index just past the postfix chain starting at pos (`.x()`, `[i]`, `++`/`--` runs). */
+  private findChainEnd(): number {
+    let j = this.pos;
+    while (j < this.toks.length) {
+      const t = this.toks[j];
+      if (t.t === "punct" && t.v === ".") {
+        const id = this.toks[j + 1];
+        if (id?.t !== "ident") break;
+        j += 2;
+        const open = this.toks[j];
+        if (open?.t === "punct" && open.v === "(") {
+          const close = matchBracket(this.toks, j);
+          if (close === -1) break;
+          j = close + 1;
+        }
+        continue;
+      }
+      if (t.t === "punct" && t.v === "[") {
+        const close = matchBracket(this.toks, j);
+        if (close === -1) break;
+        j = close + 1;
+        continue;
+      }
+      if (t.t === "punct" && (t.v === "++" || t.v === "--")) {
+        j++;
+        continue;
+      }
+      break;
+    }
+    return j;
   }
 
   /** Parses `(args)` with pos just after `(`; consumes through `)`. */
@@ -1469,25 +1688,31 @@ class Parser {
         this.pos++;
         const args = this.parseArgs();
         if (tok.v === "String") {
-          const s = args.length === 0 ? "" : coerceToString(args[0]);
-          return s === null ? null : { kind: "string", value: s };
+          if (args.length === 0) return { kind: "string", value: "" };
+          return mapSetValues(args[0], (a) => {
+            const s = coerceToString(a);
+            return s === null ? null : { kind: "string", value: s };
+          });
         }
         const data = args[0];
-        if (data === undefined || data === null || data.kind !== "string") return null;
-        if (tok.v === "atob") {
-          const decoded = decodeBase64(data.value, false);
-          return decoded === null ? null : { kind: "string", value: decoded };
-        }
-        try {
-          const decoded = tok.v === "decodeURIComponent"
-            ? decodeURIComponent(data.value)
-            : tok.v === "decodeURI"
-              ? decodeURI(data.value)
-              : unescapeJs(data.value);
-          return { kind: "string", value: decoded };
-        } catch {
-          return null;
-        }
+        if (data === undefined) return null;
+        return mapSetValues(data, (d) => {
+          if (d === null || d.kind !== "string") return null;
+          if (tok.v === "atob") {
+            const decoded = decodeBase64(d.value, false);
+            return decoded === null ? null : { kind: "string", value: decoded };
+          }
+          try {
+            const decoded = tok.v === "decodeURIComponent"
+              ? decodeURIComponent(d.value)
+              : tok.v === "decodeURI"
+                ? decodeURI(d.value)
+                : unescapeJs(d.value);
+            return { kind: "string", value: decoded };
+          } catch {
+            return null;
+          }
+        });
       }
       return this.env.get(tok.v) ?? null;
     }
@@ -1665,13 +1890,15 @@ class Parser {
   }
 
   private evalTemplate(raw: string): Value {
-    let out = "";
+    // Possible outputs: a substitution evaluating to a set fans out
+    // to one output per member (round 6b), capped like all sets.
+    let outs = [""];
     let i = 0;
     while (i < raw.length) {
       const ch = raw[i];
       if (ch === "\\" && i + 1 < raw.length) {
         const d = decodeEscape(raw, i);
-        out += d.ch;
+        outs = outs.map((o) => o + d.ch);
         i = d.next;
         continue;
       }
@@ -1683,16 +1910,24 @@ class Parser {
         // The substitution must be fully consumed: a partially parsed
         // expression (ternary, comma, ...) is not the runtime value.
         if (sub.pos !== sub.toks.length) return null;
-        const s = coerceToString(v);
-        if (s === null) return null;
-        out += s;
+        const members: Value[] = v !== null && v.kind === "set" ? v.values : [v];
+        const next: string[] = [];
+        for (const o of outs) {
+          for (const m of members) {
+            const s = coerceToString(m);
+            if (s !== null) next.push(o + s);
+          }
+          if (next.length >= 256) break;
+        }
+        if (next.length === 0) return null;
+        outs = next.slice(0, SET_CAP);
         i = close + 1;
         continue;
       }
-      out += ch;
+      outs = outs.map((o) => o + ch);
       i++;
     }
-    return { kind: "string", value: out };
+    return makeSet(outs.map((o) => ({ kind: "string" as const, value: o })));
   }
 }
 
@@ -2137,17 +2372,52 @@ function execSimple(slice: Tok[], env: Map<string, Value>, ctx: EvalCtx): void {
   // Anything else: a side-effect-free expression statement, ignored.
 }
 
+/** Flatten a resolved argument to its string material, or null if not fully resolvable. */
+function flattenArg(a: Value): string | null {
+  if (a === null) return null;
+  if (a.kind === "string") return a.value;
+  if (a.kind === "number") return String(a.value);
+  if (a.kind === "array") {
+    let out = "";
+    for (const it of a.items) {
+      const s = flattenArg(it);
+      if (s === null) return null;
+      out += s;
+    }
+    return out;
+  }
+  return null;
+}
+
+/** Add every string a value may hold (sets fan out to their members). */
+function addValueStrings(v: Value, add: (text: string) => void): void {
+  if (v === null) return;
+  if (v.kind === "string") {
+    add(v.value);
+    return;
+  }
+  if (v.kind === "set") {
+    for (const m of v.values) addValueStrings(m, add);
+  }
+}
+
 /**
  * Call-site scan pass (round 6). For every call to a diff-defined
  * function in the diff, evaluate the body with the call's arguments
  * and scan every possible return value — this catches multi-path
  * bodies (unknown-condition branches) that single-value expression
- * evaluation must leave unknown. Plus the conservative fallback:
- * concatenating the call's raw string-literal arguments (and
- * array-literal elements) in order is scanned too, so an intractable
- * body that merely forwards its literal fragments still trips the
- * scan. The fallback only fires when the concatenation itself is
- * secret-shaped, so honest helpers are untouched.
+ * evaluation must leave unknown. Plus two fallbacks, both firing
+ * only when the concatenation itself is secret-shaped, so honest
+ * helpers are untouched: the raw-literal fallback (concatenating the
+ * call's raw string-literal arguments and array-literal elements in
+ * order), and the resolved-argument fallback (round 6b: the same
+ * concatenation over RESOLVED argument values, so fragments held in
+ * variables are caught even when the body is intractable — classic
+ * for, while, recursion — and set arguments fan out to their
+ * members). An argument that does not fully resolve skips the
+ * resolved fallback for that call: its fragments are still scanned
+ * individually, and a skipped argument never contributes a
+ * fabricated partial concatenation.
  */
 function scanCallSites(
   toks: Tok[],
@@ -2170,9 +2440,7 @@ function scanCallSites(
     const argSlices = splitTopLevel(toks.slice(i + 2, close));
     const argValues = argSlices.map((s) => new Parser(s, env, ctx).parseExpr());
     const outs = evaluateFunction(callee.def, argValues, env, ctx);
-    for (const o of outs) {
-      if (o !== null && o.kind === "string") add(o.value);
-    }
+    for (const o of outs) addValueStrings(o, add);
     let concat = "";
     let any = false;
     for (const s of argSlices) {
@@ -2183,6 +2451,46 @@ function scanCallSites(
       }
     }
     if (any) add(concat);
+    // Resolved-argument fallback (round 6b): as above, over resolved
+    // values instead of raw literals; set arguments fan out.
+    const argOptions: string[][] = [];
+    let skipResolved = false;
+    for (const a of argValues) {
+      if (a !== null && a.kind === "set") {
+        const opts: string[] = [];
+        for (const m of a.values) {
+          const s = flattenArg(m);
+          if (s !== null) opts.push(s);
+        }
+        if (opts.length === 0) {
+          skipResolved = true;
+          break;
+        }
+        argOptions.push(opts);
+      } else {
+        const s = flattenArg(a);
+        if (s === null) {
+          skipResolved = true;
+          break;
+        }
+        argOptions.push([s]);
+      }
+    }
+    if (!skipResolved) {
+      let combos = [""];
+      for (const opts of argOptions) {
+        const next: string[] = [];
+        for (const c of combos) {
+          for (const o of opts) {
+            if (next.length >= 1024) break;
+            next.push(c + o);
+          }
+          if (next.length >= 1024) break;
+        }
+        combos = next;
+      }
+      for (const c of combos) add(c);
+    }
   }
 }
 
@@ -2475,9 +2783,7 @@ export function scanAddedLines(lines: string[]): string[] {
     if (!walkStatements(toks, envB, "fixpoint", ctx)) break;
   }
   for (const env of [envA, envB]) {
-    for (const v of env.values()) {
-      if (v !== null && v.kind === "string") add(v.value);
-    }
+    for (const v of env.values()) addValueStrings(v, add);
     // Bare expressions anywhere in the diff, evaluated with the final
     // environment: reconstructions that are never assigned (call
     // arguments, return values, conditions, ternary branches).
@@ -2485,11 +2791,11 @@ export function scanAddedLines(lines: string[]): string[] {
     while (!p.atEnd()) {
       const start = p.pos;
       const v = p.parseExpr();
-      if (v !== null && v.kind === "string") add(v.value);
+      addValueStrings(v, add);
       p.pos = v !== null ? Math.max(p.pos, start + 1) : start + 1;
     }
     // Call-site scan pass (round 6): multi-path function outcomes
-    // plus the raw-literal-argument fallback.
+    // plus the raw-literal-argument and resolved-argument fallbacks.
     scanCallSites(toks, env, ctx, add);
   }
   return [...hits];

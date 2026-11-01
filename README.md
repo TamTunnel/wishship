@@ -59,24 +59,34 @@ vote → approve → build → verify → review → ship.
   object), and `Array.from` / `of`. Diff-defined functions are evaluated with
   arguments bound — single returns, straight-line assignments, `for...of` loops
   with `+=` accumulation, `if`/`else` (unknown conditions union both branches'
-  returns), and function-valued `replace` callbacks. A token split across lines
+  returns), and function-valued `replace` callbacks. When a call's body yields
+  several possible returns, the result is the SET of those values (capped at
+  16, branch order), and `+`, `concat`, `join`, string methods, member/index
+  reads, template substitutions, and `String`/`atob`/decoder calls distribute
+  over the set — so a branchy helper's fragments combined with further
+  expressions at the call site are caught. A token split across lines
   or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
   operator is NOT flagged: concatenating neighboring literals fabricated tokens
   that do not exist in the source (it once blocked a JSON env dump, where `"1"`
   + `"PATH"` + the PATH value formed a 40-character slash run tripping the
   AWS-secret shape). Unresolvable expressions stay unknown and are never flagged
-  alone — EXCEPT the conservative fallback for diff-defined function calls: if
+  alone — EXCEPT the conservative fallbacks for diff-defined function calls: if
   the call's raw string-literal arguments (or array-literal elements) concatenate
   in order to a secret pattern, the scan flags it even when the body is
-  intractable. Honest code never passes fragments that concatenate to a secret
+  intractable — and the same concatenation computed over RESOLVED argument
+  values (variables bound in the diff, sets fanning out to their members), so
+  fragments held in variables are caught too. An argument that does not fully
+  resolve skips the resolved fallback for that call. Honest code never passes fragments that concatenate to a secret
   into a helper except to rebuild one, so this only fires on genuine
-  reconstructions. The residual boundary after round 6: recursion, closures over
+  reconstructions. The residual boundary after round 6b: recursion, closures over
   mutated state, classes, `eval`, classic `for` loops, `while`, `switch`, and
   `try` bodies (skipped, not interpreted) — a helper with such a body is still
-  caught when called with literal fragments (via the fallback), but NOT when
-  the fragments arrive via variables; multi-path object-method calls;
-  multi-path call results combined with further expressions at the call site
-  (each branch outcome is scanned, but not the combination); and values from
+  caught when called with fragments, literal or variable-held, via the fallbacks,
+  but a body that TRANSFORMS its inputs rather than forwarding them is not
+  modeled; multi-path object-method calls; `for...of` over a multi-valued (set)
+  array; builtin calls whose arguments are sets other than the distributed
+  operations above; function-valued `replace` callbacks whose body is
+  multi-path; spreading a set value as call arguments; and values from
   outside the diff (see the diff-only scope note below). These are stated
   limits of a diff-only value resolver, not hidden gaps.
 - **Churn override (maintainer-only, audited).** When a run blocks ONLY on the churn-size
