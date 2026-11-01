@@ -78,16 +78,22 @@ vote → approve → build → verify → review → ship.
   fragments held in variables are caught too. An argument that does not fully
   resolve skips the resolved fallback for that call. Honest code never passes fragments that concatenate to a secret
   into a helper except to rebuild one, so this only fires on genuine
-  reconstructions. The residual boundary after round 6b: recursion, closures over
-  mutated state, classes, `eval`, classic `for` loops, `while`, `switch`, and
-  `try` bodies (skipped, not interpreted) — a helper with such a body is still
-  caught when called with fragments, literal or variable-held, via the fallbacks,
-  but a body that TRANSFORMS its inputs rather than forwarding them is not
-  modeled; multi-path object-method calls; `for...of` over a multi-valued (set)
-  array; builtin calls whose arguments are sets other than the distributed
-  operations above; function-valued `replace` callbacks whose body is
-  multi-path; spreading a set value as call arguments; and values from
-  outside the diff (see the diff-only scope note below). These are stated
+  reconstructions. Round 7 completes set distribution: `for...of` loops are
+  interpreted at the top level as well as in helper bodies, modeled builtins
+  distribute over set arguments, multi-path `replace` callbacks yield
+  branch-union sets, and array `slice` / `reverse` are modeled. The residual
+  boundary after round 7: recursion, closures over mutated state, classes,
+  `eval`, classic `for` loops, `while`, `switch`, and `try` bodies (skipped,
+  not interpreted) — a helper with such a body is still caught when called
+  with fragments, literal or variable-held, via the fallbacks, but a body
+  that TRANSFORMS its inputs rather than forwarding them is not modeled;
+  multi-path object-method calls; and values from outside the diff (see the
+  diff-only scope note below). Beyond that, the stopping boundary is
+  transform-aware obfuscation — custom ciphers, custom encodings, and reorder
+  tricks beyond `reverse` — which is undecidable for static analysis in
+  general; a diff carrying a cipher and only encoded fragments contains no
+  secret halves in any form, and the decoder itself is a visible tell in the
+  PR diff, so maintainer PR review is the backstop there. These are stated
   limits of a diff-only value resolver, not hidden gaps.
 - **Churn override (maintainer-only, audited).** When a run blocks ONLY on the churn-size
   heuristic — e.g. a legitimate 30-line helper with no relation to the wish — the
