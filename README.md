@@ -85,7 +85,12 @@ vote → approve → build → verify → review → ship.
   forms and object properties holding a set of functions)
   evaluates per callee member — with `String.fromCharCode` /
   `String.fromCodePoint` referenced as values resolving to
-  builtin values instead of collapsing to null. A token split across lines
+  builtin values instead of collapsing to null. Round 10b closes
+  the last push position: a plain `.push()` in an assignment RHS
+  (`const n = arr.push(...)`) applies the push side effect in
+  sequential mode, mirroring `.push.apply` — previously only push
+  statements were tracked, so an RHS push left the array empty to
+  the scan. A token split across lines
   or rebuilt from quoted fragments fails the scan. Mere adjacency without a join
   operator is NOT flagged: concatenating neighboring literals fabricated tokens
   that do not exist in the source (it once blocked a JSON env dump, where `"1"`

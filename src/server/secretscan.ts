@@ -210,6 +210,11 @@ export function scanSecrets(text: string): string[] {
  *   expression (fixpoint/bare passes) is still not
  *   side-effect-tracked by design, except assignment-RHS cases
  *   via the Parser (where the value-level fallback above applies).
+ * - plain push in assignment RHS (round 10b): `const n =
+ *   arr.push(...)` now applies the push side effect in the Parser
+ *   in sequential mode only, mirroring `.push.apply` — previously
+ *   only push statements were tracked, so an RHS push left the
+ *   array [] to the scan and the joined value shipped.
  *
  * Deliberately NOT modeled (stays unknown, never flagged alone):
  * - recursion, closures over mutated state, classes, `eval`, and
@@ -1875,6 +1880,75 @@ class Parser {
               v = makeSet(outs);
               continue;
             }
+          }
+          // Round 10b: plain `.push()` in expression position
+          // (e.g. an assignment RHS: `const n = arr.push(...)`)
+          // applies the push side effect in sequential mode only,
+          // mirroring `.push.apply` in tryApplyCall — previously
+          // only push STATEMENTS were tracked, so an RHS push left
+          // the array [] to the scan and the joined value shipped.
+          // Non-sequential modes fall through to the generic
+          // fallback below, as before (the fixpoint pass stays
+          // assignments-only; ad-hoc parsers have no mode). Own
+          // push methods on object receivers were already claimed
+          // by the object branch above. Returns the new length
+          // (or a set of lengths for a set target), or null when
+          // nothing was pushed — the same contract as tryApplyCall's
+          // push branch, including its multi-variant position-wise
+          // set items and unequal-length flat fallback.
+          if (
+            member.v === "push" &&
+            this.ctx.mode === "sequential" &&
+            v !== null && (v.kind === "array" || v.kind === "set")
+          ) {
+            this.pos += 3;
+            const raw = this.parseArgsRaw();
+            const variants = expandArgVariants(raw);
+            const targets: Value[] = [];
+            if (v.kind === "array") targets.push(v);
+            else {
+              for (const m of v.values) {
+                if (m !== null && m.kind === "array") targets.push(m);
+              }
+            }
+            if (targets.length === 0) return null;
+            if (variants.length === 1) {
+              const els = variants[0] ?? [];
+              for (const t of targets) {
+                if (t !== null && t.kind === "array") t.items.push(...els);
+              }
+            } else if (variants.length > 1) {
+              const len = variants[0]?.length ?? 0;
+              const equal = variants.every((x) => x.length === len);
+              if (equal) {
+                for (const t of targets) {
+                  if (t === null || t.kind !== "array") continue;
+                  for (let i = 0; i < len; i++) {
+                    t.items.push(makeSet(variants.map((x) => x[i] ?? null)));
+                  }
+                }
+              } else {
+                const flat: Value[] = [];
+                for (const a of raw) {
+                  if (a.spread && a.value !== null && a.value.kind === "array") {
+                    flat.push(...a.value.items);
+                  } else {
+                    flat.push(a.value);
+                  }
+                }
+                for (const t of targets) {
+                  if (t !== null && t.kind === "array") t.items.push(...flat);
+                }
+              }
+            }
+            const lens: Value[] = [];
+            for (const t of targets) {
+              if (t !== null && t.kind === "array") {
+                lens.push({ kind: "number", value: t.items.length });
+              }
+            }
+            v = makeSet(lens);
+            continue;
           }
           // Any other method call: unknown result; consume args and stop.
           this.pos += 3;
